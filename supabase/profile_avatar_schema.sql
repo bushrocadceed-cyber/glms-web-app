@@ -1,0 +1,19 @@
+-- Superseded by schema.sql, which includes this file's content along with
+-- every table/column/index the project needs. Kept here standalone in case
+-- you ever want to re-apply just this piece on its own.
+--
+-- Adds durable avatar storage to profiles (staff/admin accounts). Safe to
+-- re-run. Run this in the Supabase SQL Editor.
+--
+-- Stores the picture as a base64 data URL directly in this text column —
+-- same approach already used for books.cover_image/pdf_url in this
+-- project (no Supabase Storage bucket involved, so there's nothing that
+-- can fail with "Bucket not found"). Postgres text columns have no
+-- practical length limit, so a ~1.5MB image (the app's own upload cap,
+-- see MAX_AVATAR_BYTES) fits comfortably.
+--
+-- No RLS policy changes needed: profiles_update_self / profiles_update_admin
+-- in rls_policies.sql already cover every column via `for update`, not a
+-- column-specific grant, so avatar_url is automatically writable by
+-- whoever could already update full_name on the same row.
+alter table public.profiles add column if not exists avatar_url text;
