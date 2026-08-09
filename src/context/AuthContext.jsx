@@ -1,21 +1,22 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import { getAvatar, hydrateAvatarFromRow, persistAvatarRemote, setAvatar } from '../lib/avatarStore';
-import {
-  isAvatarColumnKnownMissing,
-  recordAvatarColumnMissing,
-  recordAvatarColumnPresent,
-} from '../lib/profileAvatarColumn';
+import { isAvatarColumnKnownPresent, recordProfileRow as recordAvatarProfileRow } from '../lib/profileAvatarColumn';
 
 const AuthContext = createContext(null);
 
-// avatar_url is included once the column is known to exist (see
-// profileAvatarColumn.js) — an explicit column list 400s outright on a
-// missing column (unlike select('*')), so this can't just always ask for
-// it. On first-ever call in a session it optimistically tries with
-// avatar_url, and quietly retries once without it if that 400s, caching
-// the answer so every later profile load (every login, every auth state
-// change) skips straight to the version that actually works.
+// select('*') rather than an explicit column list: '*' always succeeds
+// regardless of which optional columns (avatar_url) exist, and its shape
+// doubles as how the app learns whether avatar_url exists at all — see
+// profileAvatarColumn.js, which updateAvatar below reads from so it never
+// has to fire a request that's guaranteed to 400. An earlier version of
+// this used an explicit column list that optimistically included
+// avatar_url on the first call of every fresh page load (the "known
+// missing" cache resets on every reload) and only self-corrected after
+// that first request had already failed for real — this runs on every
+// single page in the app via loadProfile below, so that was a guaranteed
+// 400 on every fresh session. select('*') removes the failure mode
+// entirely rather than just recovering from it faster.
 //
 // Logs loudly on any failure to load — an earlier version of this
 // silently returned null on any error "for a clean console," which made
@@ -25,17 +26,9 @@ const AuthContext = createContext(null);
 // nothing in the console to point at the actual cause. Never silence a
 // real failure just to keep the console quiet.
 async function fetchProfileRow(userId) {
-  const columns = isAvatarColumnKnownMissing()
-    ? 'id, full_name, role, created_at'
-    : 'id, full_name, role, created_at, avatar_url';
-
-  const { data, error } = await supabase.from('profiles').select(columns).eq('id', userId);
+  const { data, error } = await supabase.from('profiles').select('*').eq('id', userId);
 
   if (error) {
-    if (columns.includes('avatar_url') && (error.code === '42703' || error.code === 'PGRST204')) {
-      recordAvatarColumnMissing();
-      return fetchProfileRow(userId);
-    }
     console.error(
       `Failed to load profile for user ${userId} — likely a Row Level Security issue on 'profiles'. ` +
         'Check: select * from pg_policies where tablename = \'profiles\';',
@@ -53,7 +46,7 @@ async function fetchProfileRow(userId) {
     return null;
   }
 
-  if (columns.includes('avatar_url')) recordAvatarColumnPresent();
+  recordAvatarProfileRow(data[0]);
   return data[0];
 }
 
@@ -170,16 +163,21 @@ export function AuthProvider({ children }) {
 
   // Updates local state + the localStorage cache synchronously (so the
   // header/sidebar/profile page re-render immediately, no network wait),
-  // then persists the same picture to profiles.avatar_url in the
-  // background — see avatarStore.js for why this is a fire-and-forget
-  // best-effort call rather than something this function awaits or throws
-  // from: a slow or failed remote write should never block what the user
-  // actually sees happen, which is the picture changing right away.
+  // then — only once profiles.avatar_url is confirmed to exist — persists
+  // the same picture there in the background. See avatarStore.js for why
+  // this is a fire-and-forget best-effort call rather than something this
+  // function awaits or throws from: a slow or failed remote write should
+  // never block what the user actually sees happen, which is the picture
+  // changing right away. The isAvatarColumnKnownPresent() guard is what
+  // stops this from firing a request that's guaranteed to 400 on a
+  // database where that column doesn't exist yet.
   async function updateAvatar(dataUrl) {
     if (!user) throw new Error('Not signed in.');
     setAvatarUrl(dataUrl);
     setAvatar(user.id, dataUrl);
-    persistAvatarRemote('profiles', user.id, dataUrl);
+    if (isAvatarColumnKnownPresent()) {
+      persistAvatarRemote('profiles', user.id, dataUrl);
+    }
   }
 
   // Supabase's updateUser() has no concept of a "current password" — it

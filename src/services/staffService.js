@@ -9,7 +9,25 @@ import {
   recordEmailColumnMissing,
   recordProfileRow,
 } from '../lib/staffContactColumns';
+import {
+  isAvatarColumnKnownPresent,
+  recordProfileRow as recordAvatarProfileRow,
+} from '../lib/profileAvatarColumn';
 import { isAdminRole } from '../lib/roles';
+
+// Only actually writes once profiles.avatar_url is confirmed to exist
+// (learned for free from getStaffProfiles's select('*') below) — the same
+// "confirm before touching" rule as findProfileByEmail/persistStaffEmail.
+// persistAvatarRemote itself has no such gate (it's table-agnostic, so it
+// can't know this on its own), which meant every Edit Staff save, Add
+// Staff Member, and Register Admin fired a real request against a column
+// that's never existed on this project's database — this wrapper is what
+// every call site below uses instead of calling persistAvatarRemote directly.
+function maybePersistAvatarRemote(id, avatarDataUrl) {
+  if (isAvatarColumnKnownPresent()) {
+    persistAvatarRemote('profiles', id, avatarDataUrl);
+  }
+}
 
 // trash: false -> active (non-deleted) people, true -> the trash list. The
 // database is never asked about is_deleted at all — every profile is
@@ -33,7 +51,10 @@ export async function getStaffProfiles({ trash = false, roleGroup } = {}) {
   const { data, error } = await supabase.from('profiles').select('*').order('created_at', { ascending: false });
 
   if (error) throw error;
-  if (data?.[0]) recordProfileRow(data[0]);
+  if (data?.[0]) {
+    recordProfileRow(data[0]);
+    recordAvatarProfileRow(data[0]);
+  }
 
   return (data ?? [])
     .filter((row) => isTrashed(row.id) === trash)
@@ -139,7 +160,7 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
 
     if (avatarDataUrl) {
       setAvatar(existing.id, avatarDataUrl);
-      persistAvatarRemote('profiles', existing.id, avatarDataUrl);
+      maybePersistAvatarRemote(existing.id, avatarDataUrl);
     }
     return { id: existing.id, updatedExisting: true, emailSaved };
   }
@@ -165,7 +186,7 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
 
   if (avatarDataUrl) {
     setAvatar(id, avatarDataUrl);
-    persistAvatarRemote('profiles', id, avatarDataUrl);
+    maybePersistAvatarRemote(id, avatarDataUrl);
   }
   return { id, updatedExisting: false, emailSaved };
 }
@@ -303,7 +324,7 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
 
   if (avatarDataUrl) {
     setAvatar(user.id, avatarDataUrl);
-    persistAvatarRemote('profiles', user.id, avatarDataUrl);
+    maybePersistAvatarRemote(user.id, avatarDataUrl);
   }
 
   // The login itself is already fully created and working at this point —
@@ -382,7 +403,7 @@ export async function updateStaffProfile(id, { fullName, role, email, active = t
   const emailSaved = await persistStaffEmail(id, email);
 
   setAvatar(id, avatarDataUrl);
-  persistAvatarRemote('profiles', id, avatarDataUrl);
+  maybePersistAvatarRemote(id, avatarDataUrl);
   if (active) markActive(id);
   else markInactive(id);
 
