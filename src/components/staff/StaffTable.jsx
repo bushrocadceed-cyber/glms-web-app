@@ -4,8 +4,8 @@ import Avatar from '../ui/Avatar';
 
 function columnsFor(view) {
   return view === 'active'
-    ? ['Full Name', 'Role', 'Status', 'Added On', 'Actions']
-    : ['Full Name', 'Role', 'Added On', 'Actions'];
+    ? ['Full Name', 'Email', 'Role', 'Status', 'Added On', 'Actions']
+    : ['Full Name', 'Email', 'Role', 'Added On', 'Actions'];
 }
 
 function formatDate(value) {
@@ -82,6 +82,7 @@ export default function StaffTable({
                       </span>
                     </div>
                   </td>
+                  <td className="px-6 py-4 text-sm text-slate-600">{person.email || '—'}</td>
                   <td className="px-6 py-4">
                     <span
                       className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ${

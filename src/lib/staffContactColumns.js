@@ -21,3 +21,18 @@ export function recordEmailColumnMissing() {
 export function isEmailColumnKnownMissing() {
   return emailColumnExists === false;
 }
+
+// Deliberately the mirror image of isEmailColumnKnownMissing rather than
+// its exact negation — that distinction matters for callers about to fire
+// a request that references the email column directly (a filter or an
+// update payload), not just read it. isEmailColumnKnownMissing() treats
+// "still unknown" (null — nothing has recorded a row yet, e.g. the first
+// fetch returned zero rows, or ran concurrently with a submit) the same
+// as "confirmed to exist", which is an optimistic default that's safe for
+// reads (select('*') never fails) but not for a request that's guaranteed
+// to 400 if the guess is wrong. isEmailColumnKnownPresent() only returns
+// true once a row has actually proven the column is there, so "unknown"
+// correctly falls on the side of "don't risk it" for those call sites.
+export function isEmailColumnKnownPresent() {
+  return emailColumnExists === true;
+}

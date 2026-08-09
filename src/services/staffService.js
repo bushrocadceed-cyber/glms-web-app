@@ -4,7 +4,11 @@ import { getAvatar, hydrateAvatarFromRow, persistAvatarRemote, setAvatar } from 
 import { isTrashed, markTrashed, unmarkTrashed } from '../lib/trashStore';
 import { isInactive, markActive, markInactive } from '../lib/staffStatusStore';
 import { getStaffEmail, setStaffEmail as setLocalStaffEmail } from '../lib/staffEmailStore';
-import { isEmailColumnKnownMissing, recordEmailColumnMissing, recordProfileRow } from '../lib/staffContactColumns';
+import {
+  isEmailColumnKnownPresent,
+  recordEmailColumnMissing,
+  recordProfileRow,
+} from '../lib/staffContactColumns';
 import { isAdminRole } from '../lib/roles';
 
 // trash: false -> active (non-deleted) people, true -> the trash list. The
@@ -67,20 +71,27 @@ export async function inviteStaff({ email, fullName, role }) {
 }
 
 // Looks up an existing profile by email so we can update it instead of
-// attempting to create a duplicate account. Skips the request entirely if
-// the email column is already known missing (learned from getStaffProfiles
-// above) — confirmed live, this project's profiles table currently has
-// neither an email nor a phone column, so without this check every single
-// Register Admin / Add Staff Member submission fired a request guaranteed
-// to 400. Still degrades gracefully (42703) for the rare case this runs
-// before any profile list has ever loaded.
+// attempting to create a duplicate account. Only actually queries once the
+// email column is *confirmed* to exist (learned for free from
+// getStaffProfiles's select('*')) — not merely "not yet confirmed
+// missing". Those are different states: right after a fresh page load, or
+// if the very first profiles fetch happened to return zero rows, nothing
+// has recorded either way yet, and treating that "unknown" as "assume it
+// exists" is exactly what let this filter (.eq('email', ...), which
+// references the column directly) fire for real and 400 — confirmed live,
+// this project's profiles table has never had an email column. Requiring
+// positive confirmation before ever touching the column directly makes
+// that 400 structurally impossible now, rather than just caught after the
+// fact; the 42703/PGRST204 handling below is a second line of defense for
+// the one case that can still legitimately reach it (the column existed
+// when confirmed, then was dropped mid-session).
 async function findProfileByEmail(email) {
-  if (isEmailColumnKnownMissing()) return { emailColumnExists: false, existing: null };
+  if (!isEmailColumnKnownPresent()) return { emailColumnExists: false, existing: null };
 
   const { data, error } = await supabase.from('profiles').select('id').eq('email', email).maybeSingle();
 
   if (error) {
-    if (error.code === '42703') {
+    if (error.code === '42703' || error.code === 'PGRST204') {
       recordEmailColumnMissing();
       return { emailColumnExists: false, existing: null };
     }
@@ -104,6 +115,17 @@ async function findProfileByEmail(email) {
 // login) — used directly by createStaffAccount, and reused by
 // registerAdmin below as its fallback when a real login can't be created
 // (rate limited) so the person's details aren't lost.
+//
+// email is deliberately NOT included in either payload below — the insert/
+// update only ever carries the columns confirmed to exist. Saving the
+// address itself is delegated entirely to persistStaffEmail (defined
+// further down, hoisted so it's callable from here), which tries the real
+// profiles.email column and, regardless of whether that column exists,
+// always writes the address to staffEmailStore.js too. That local fallback
+// is what StaffTable's Email column and Reset Password actually read from
+// — without this call, an email typed into Add Staff Member or Register
+// Admin was silently dropped on any database missing profiles.email
+// (confirmed missing here), never saved anywhere at all.
 async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUrl, existing, emailColumnExists }) {
   if (existing) {
     const payload = emailColumnExists
@@ -113,11 +135,13 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
     const { error } = await supabase.from('profiles').update(payload).eq('id', existing.id);
     if (error) throw error;
 
+    const emailSaved = await persistStaffEmail(existing.id, email);
+
     if (avatarDataUrl) {
       setAvatar(existing.id, avatarDataUrl);
       persistAvatarRemote('profiles', existing.id, avatarDataUrl);
     }
-    return { id: existing.id, updatedExisting: true };
+    return { id: existing.id, updatedExisting: true, emailSaved };
   }
 
   // profiles.id normally has to reference a real auth.users row (foreign
@@ -133,11 +157,17 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
   const { error } = await supabase.from('profiles').insert(payload);
   if (error) throw error;
 
+  // Already included in the insert payload above when the column exists —
+  // this still runs either way, since it's also what writes the local
+  // fallback; persistStaffEmail's own update is a harmless no-op re-write
+  // in that case, not a duplicate insert.
+  const emailSaved = await persistStaffEmail(id, email);
+
   if (avatarDataUrl) {
     setAvatar(id, avatarDataUrl);
     persistAvatarRemote('profiles', id, avatarDataUrl);
   }
-  return { id, updatedExisting: false };
+  return { id, updatedExisting: false, emailSaved };
 }
 
 // Creates a profiles-only staff directory entry. Per explicit instruction,
@@ -149,7 +179,7 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
 export async function createStaffAccount({ fullName, email, role, phone, avatarDataUrl }) {
   const { emailColumnExists, existing } = await findProfileByEmail(email);
   const result = await upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUrl, existing, emailColumnExists });
-  return { success: true, updatedExisting: result.updatedExisting };
+  return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
 }
 
 // Creates a REAL Supabase Auth login (unlike createStaffAccount above,
@@ -195,7 +225,7 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
       existing,
       emailColumnExists,
     });
-    return { success: true, updatedExisting: result.updatedExisting };
+    return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
   }
 
   const tempClient = getTempAuthClient();
@@ -221,7 +251,7 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
       // this person can't sign in yet — Invite via Email, or retrying
       // Register Admin once the rate limit clears, is what actually grants
       // access; this never pretends a login exists when it doesn't.
-      await upsertDirectoryEntry({
+      const fallbackResult = await upsertDirectoryEntry({
         fullName,
         email,
         role: 'admin',
@@ -236,7 +266,13 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
       // this after Ns" (a per-identity throttle) are different problems
       // with different fixes, and only Supabase's own message actually
       // says which one this is.
-      return { success: true, loginCreated: false, rateLimited: true, rateLimitMessage: signUpError.message };
+      return {
+        success: true,
+        loginCreated: false,
+        rateLimited: true,
+        rateLimitMessage: signUpError.message,
+        emailSaved: fallbackResult.emailSaved,
+      };
     }
 
     throw signUpError;
@@ -257,6 +293,14 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
   const promotePayload = emailColumnExists ? { role: 'admin', phone: phone || null } : { role: 'admin' };
   const { error: promoteError } = await supabase.from('profiles').update(promotePayload).eq('id', user.id);
 
+  // Same gap this whole function is otherwise careful about: the promote
+  // step above never touches profiles.email (it wasn't in promotePayload
+  // to begin with), so without this call a freshly-registered admin would
+  // have a real login but still show no email anywhere in the Manage Staff
+  // table — persistStaffEmail is what writes it to profiles.email (if that
+  // column exists) and to the local fallback either way.
+  const emailSaved = await persistStaffEmail(user.id, email);
+
   if (avatarDataUrl) {
     setAvatar(user.id, avatarDataUrl);
     persistAvatarRemote('profiles', user.id, avatarDataUrl);
@@ -268,30 +312,48 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
   // admin to promote manually via Edit instead of masking it as a full
   // success or a full failure.
   if (promoteError) {
-    return { success: true, loginCreated: true, promotedToAdmin: false };
+    return { success: true, loginCreated: true, promotedToAdmin: false, emailSaved };
   }
 
-  return { success: true, loginCreated: true, promotedToAdmin: true };
+  return { success: true, loginCreated: true, promotedToAdmin: true, emailSaved };
 }
 
 // Shared by updateStaffProfile and saveStaffEmail below. Tries the real
 // profiles.email column first (same graceful-degrade dance as
-// findProfileByEmail/upsertDirectoryEntry: skip entirely once the column is
-// known missing, otherwise try it and fall back silently on a 42703,
-// recording it missing for next time). Either way, the address is also
-// always written to staffEmailStore.js — that's what makes it survive a
-// refresh and what Reset Password reads back, regardless of whether the
-// database column actually exists. Returns whether the real column save
-// went through, so callers can tell the admin when it didn't rather than
-// pretending it did.
+// findProfileByEmail/upsertDirectoryEntry: only actually attempt the write
+// once the column is *confirmed* present, not just "not yet confirmed
+// missing" — see the note on findProfileByEmail for why that distinction
+// is what keeps this from firing a request that's guaranteed to 400 the
+// first time it's ever called in a session). Either way, the address is
+// also always written to staffEmailStore.js — that's what makes it
+// survive a refresh and what Reset Password reads back, regardless of
+// whether the database column actually exists. Returns whether the real
+// column save went through, so callers can tell the admin when it didn't
+// rather than pretending it did.
 async function persistStaffEmail(id, email) {
   let emailSaved = false;
 
-  if (email && !isEmailColumnKnownMissing()) {
+  if (email && isEmailColumnKnownPresent()) {
     const { error } = await supabase.from('profiles').update({ email }).eq('id', id);
     if (error) {
-      if (error.code === '42703') {
+      // 42703 (raw Postgres "column does not exist") and PGRST204
+      // (PostgREST's own "not in the schema cache" code for an update/
+      // insert payload) both mean the same thing here — this update shape
+      // specifically surfaces PGRST204 on this project, which the earlier
+      // version of this function didn't check, so a missing column here
+      // threw and failed the *entire* Edit Staff save, not just the email
+      // part. Every other missing-column update in this codebase
+      // (InventoryPage, loanService, activityLogService) already checks
+      // both codes — this brings persistStaffEmail in line with that.
+      if (error.code === '42703' || error.code === 'PGRST204') {
         recordEmailColumnMissing();
+      } else if (error.code === '23505') {
+        // Real failure, not a missing-column case — profiles.email exists
+        // and has a uniqueness constraint, and this address belongs to
+        // another row already. Surfaced as a specific, actionable message
+        // instead of Postgres's raw "duplicate key value violates unique
+        // constraint ..." text.
+        throw new Error('This email address is already used by another staff or admin account.');
       } else {
         throw error;
       }

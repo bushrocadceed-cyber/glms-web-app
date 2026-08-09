@@ -88,6 +88,13 @@ export default function AdminRegistrationPage() {
         showToast(`Admin account created for ${values.email}.`);
       }
 
+      if (values.email && !result.rateLimited && !result.emailSaved) {
+        showToast(
+          "Note: email is saved on this browser only for now — this database's profiles table has no email column yet, so it won't show up for other admins until the setup SQL is run.",
+          'error'
+        );
+      }
+
       setIsRegisterModalOpen(false);
       refetch();
     } catch (err) {
@@ -105,7 +112,7 @@ export default function AdminRegistrationPage() {
       showToast(`${editingPerson.full_name ?? 'Staff member'} updated.`);
       if (values.email && !result.emailSaved) {
         showToast(
-          'Note: the email could not be saved — this database\'s profiles table has no email column yet.',
+          "Note: email is saved on this browser only for now — this database's profiles table has no email column yet, so it won't show up for other admins until the setup SQL is run.",
           'error'
         );
       }
