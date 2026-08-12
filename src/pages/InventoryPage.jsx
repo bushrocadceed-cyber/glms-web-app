@@ -67,6 +67,32 @@ function BookCoverThumb({ src, size = 'sm' }) {
   );
 }
 
+// Matches the skeleton-row pattern already used in StaffTable/LoansTable —
+// placeholder bars with the same pulse animation, shaped per column (a
+// thumbnail-sized block for Cover, two action-button-sized blocks for
+// Actions) rather than one generic "Loading…" row, so the table's actual
+// layout is visible immediately instead of collapsing to a single line.
+function BookSkeletonRow() {
+  return (
+    <tr>
+      <td className="px-6 py-4">
+        <div className="h-14 w-10 animate-pulse rounded-md bg-slate-200" />
+      </td>
+      {Array.from({ length: 7 }).map((_, i) => (
+        <td key={i} className="px-6 py-4">
+          <div className="h-4 w-full max-w-[8rem] animate-pulse rounded bg-slate-200" />
+        </td>
+      ))}
+      <td className="px-6 py-4">
+        <div className="flex items-center gap-1">
+          <div className="h-8 w-8 animate-pulse rounded-lg bg-slate-200" />
+          <div className="h-8 w-8 animate-pulse rounded-lg bg-slate-200" />
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 // PostgREST rejects an insert/update/select outright if it references any
 // column the schema cache doesn't know about — an insert/update won't save
 // the other, valid fields either. So rather than block on that, callers
@@ -769,21 +795,35 @@ export default function InventoryPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {loading && (
-                  <tr>
-                    <td colSpan={9} className="px-6 py-10 text-center text-sm text-slate-500">
-                      <div className="flex items-center justify-center gap-2">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Loading inventory…
-                      </div>
-                    </td>
-                  </tr>
-                )}
+                {loading && Array.from({ length: 6 }).map((_, i) => <BookSkeletonRow key={i} />)}
 
                 {!loading && filteredBooks.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-6 py-10 text-center text-sm text-slate-500">
-                      {view === 'trash' ? 'Trash is empty.' : 'No books found in inventory yet.'}
+                    <td colSpan={9} className="px-6 py-16 text-center">
+                      <div className="flex flex-col items-center gap-3">
+                        <div className="flex h-14 w-14 items-center justify-center rounded-full bg-slate-100">
+                          <BookImage className="h-6 w-6 text-slate-400" />
+                        </div>
+                        {view === 'trash' ? (
+                          <p className="text-sm text-slate-500">Trash is empty.</p>
+                        ) : books.length > 0 ? (
+                          <p className="text-sm text-slate-500">No books match your search or filter.</p>
+                        ) : (
+                          <>
+                            <p className="text-sm text-slate-500">
+                              No books found. Click &quot;Add Book&quot; to get started.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={openAddModal}
+                              className="mt-1 flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-primary-700"
+                            >
+                              <Plus className="h-4 w-4" />
+                              Add Book
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 )}
