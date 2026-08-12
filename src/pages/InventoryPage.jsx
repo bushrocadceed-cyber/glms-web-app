@@ -151,6 +151,26 @@ function isMissingColumnError(err) {
   return err?.code === 'PGRST204' || err?.code === '42703';
 }
 
+// Names exactly which column an isMissingColumnError was about — both
+// shapes say so directly in their message (confirmed live: PGRST204 as
+// "Could not find the 'x' column of 'books' in the schema cache", 42703 as
+// "column books.x does not exist"). This matters because this table
+// currently has more than one optional column missing at once
+// (replacement_cost and cover_thumbnail, as of this writing) — the retry
+// loops below use this to drop only the specific field Postgres actually
+// complained about, instead of assuming a fixed order of "it must be the
+// next thing on the list", which previously meant a database missing, say,
+// replacement_cost would cause cover_image/pdf_url to get dropped from the
+// save too even though those columns exist and are fine.
+function missingColumnName(err) {
+  if (!isMissingColumnError(err)) return null;
+  const msg = err?.message || '';
+  const pgrst = msg.match(/Could not find the '([^']+)' column/i);
+  if (pgrst) return pgrst[1];
+  const pg = msg.match(/column [^.\s]+\.?"?([a-zA-Z_]\w*)"?\s+does not exist/i);
+  return pg ? pg[1] : null;
+}
+
 export default function InventoryPage() {
   const { showToast } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -297,26 +317,33 @@ export default function InventoryPage() {
 
       // Only the rows query ever references replacement_cost/cover_thumbnail
       // — retry just that one in place rather than the whole Promise.all
-      // trio, dropping cover_thumbnail first (the newer column, more likely
-      // to be missing on a database that hasn't run the latest setup SQL
-      // yet) and only then replacement_cost too if it's still failing.
+      // trio. Drops exactly the column Postgres/PostgREST names as missing
+      // (see missingColumnName) instead of assuming a fixed order: with
+      // both columns genuinely missing at once, a fixed order happens to
+      // converge to the same place, but if only ONE of them were actually
+      // missing, guessing wrong would permanently (for this session) stop
+      // selecting the other column too — even though it exists and its data
+      // is fine — since there'd be no later attempt that puts it back.
       // Still covered by the same controller/deadline as the first attempt.
-      if (rowsError && !coverThumbnailMissingRef.current && isMissingColumnError(rowsError)) {
-        coverThumbnailMissingRef.current = true;
-        columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!rowsError || !isMissingColumnError(rowsError)) break;
+
+        const missingCol = missingColumnName(rowsError);
+        if (missingCol === 'cover_thumbnail' && columns.includes('cover_thumbnail')) {
+          coverThumbnailMissingRef.current = true;
+        } else if (missingCol === 'replacement_cost' && columns.includes('replacement_cost')) {
+          replacementCostMissingRef.current = true;
+        } else {
+          break; // Unrecognized column — stop retrying and let the real error surface.
+        }
+
+        columns = baseColumns;
+        if (!replacementCostMissingRef.current) columns += ', replacement_cost';
+        if (!coverThumbnailMissingRef.current) columns += ', cover_thumbnail';
+
         ({ data: rows, error: rowsError } = await supabase
           .from('books')
           .select(columns)
-          .eq('is_deleted', isTrash)
-          .order('created_at', { ascending: false })
-          .abortSignal(controller.signal));
-      }
-
-      if (rowsError && !replacementCostMissingRef.current && isMissingColumnError(rowsError)) {
-        replacementCostMissingRef.current = true;
-        ({ data: rows, error: rowsError } = await supabase
-          .from('books')
-          .select(baseColumns)
           .eq('is_deleted', isTrash)
           .order('created_at', { ascending: false })
           .abortSignal(controller.signal));
@@ -511,38 +538,39 @@ export default function InventoryPage() {
     try {
       // Try including replacement_cost + cover_thumbnail + cover/PDF first —
       // only falls back if the database is missing one of those optional
-      // columns, so a book always saves even when they aren't set up.
-      // cover_thumbnail is dropped independently of cover_image/pdf_url
-      // (before them, since it's the newest column and most likely to be
-      // the one a not-yet-updated database is missing), and replacement_cost
-      // independently of both (see the retries below), so a database
-      // missing just one of them doesn't lose the others.
-      const fullPayload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
-      if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
-      if (!coverThumbnailMissingRef.current) fullPayload.cover_thumbnail = addCoverThumbnail;
+      // columns, so a book always saves even when they aren't set up. Each
+      // retry below drops exactly the column Postgres/PostgREST just named
+      // as missing (see missingColumnName) rather than assuming a fixed
+      // order — with more than one optional column genuinely missing at
+      // once, guessing wrong here used to silently drop cover_image/pdf_url
+      // from the save even though those columns exist and work fine.
+      const payload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
+      if (!replacementCostMissingRef.current) payload.replacement_cost = replacementCost;
+      if (!coverThumbnailMissingRef.current) payload.cover_thumbnail = addCoverThumbnail;
 
-      let { error: saveError } = await supabase.from('books').insert(fullPayload);
+      let saveError = null;
       let coverPdfSkipped = false;
       let replacementCostSkipped = false;
 
-      if (saveError && !coverThumbnailMissingRef.current && isMissingColumnError(saveError)) {
-        coverThumbnailMissingRef.current = true;
-        const retryPayload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
-        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
-        ({ error: saveError } = await supabase.from('books').insert(retryPayload));
-      }
+      for (let attempt = 0; attempt < 4; attempt++) {
+        ({ error: saveError } = await supabase.from('books').insert(payload));
+        if (!saveError || !isMissingColumnError(saveError)) break;
 
-      if (saveError && isMissingColumnError(saveError)) {
-        coverPdfSkipped = true;
-        const retryPayload = { ...basePayload };
-        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
-        ({ error: saveError } = await supabase.from('books').insert(retryPayload));
-      }
-
-      if (saveError && isMissingColumnError(saveError) && !replacementCostMissingRef.current) {
-        replacementCostMissingRef.current = true;
-        replacementCostSkipped = true;
-        ({ error: saveError } = await supabase.from('books').insert(basePayload));
+        const missingCol = missingColumnName(saveError);
+        if (missingCol === 'cover_thumbnail' && 'cover_thumbnail' in payload) {
+          coverThumbnailMissingRef.current = true;
+          delete payload.cover_thumbnail;
+        } else if (missingCol === 'replacement_cost' && 'replacement_cost' in payload) {
+          replacementCostMissingRef.current = true;
+          replacementCostSkipped = true;
+          delete payload.replacement_cost;
+        } else if ((missingCol === 'cover_image' || missingCol === 'pdf_url') && ('cover_image' in payload || 'pdf_url' in payload)) {
+          coverPdfSkipped = true;
+          delete payload.cover_image;
+          delete payload.pdf_url;
+        } else {
+          break; // Unrecognized column — stop retrying and let the real error surface.
+        }
       }
 
       if (saveError) throw saveError;
@@ -751,32 +779,38 @@ export default function InventoryPage() {
         status: newAvailable <= 0 ? 'checked_out' : 'available',
       };
 
-      const fullPayload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
-      if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
-      if (!coverThumbnailMissingRef.current) fullPayload.cover_thumbnail = coverThumbnail;
+      // See the matching comment in handleAddSubmit: each retry drops
+      // exactly the column Postgres/PostgREST just named as missing, so a
+      // database missing more than one optional column at once can't cause
+      // a wrong guess to strip cover_image/pdf_url from a save that should
+      // have kept them.
+      const payload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
+      if (!replacementCostMissingRef.current) payload.replacement_cost = replacementCost;
+      if (!coverThumbnailMissingRef.current) payload.cover_thumbnail = coverThumbnail;
 
-      let { error: saveError } = await supabase.from('books').update(fullPayload).eq('id', original.id);
+      let saveError = null;
       let coverPdfSkipped = false;
       let replacementCostSkipped = false;
 
-      if (saveError && !coverThumbnailMissingRef.current && isMissingColumnError(saveError)) {
-        coverThumbnailMissingRef.current = true;
-        const retryPayload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
-        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
-        ({ error: saveError } = await supabase.from('books').update(retryPayload).eq('id', original.id));
-      }
+      for (let attempt = 0; attempt < 4; attempt++) {
+        ({ error: saveError } = await supabase.from('books').update(payload).eq('id', original.id));
+        if (!saveError || !isMissingColumnError(saveError)) break;
 
-      if (saveError && isMissingColumnError(saveError)) {
-        coverPdfSkipped = true;
-        const retryPayload = { ...basePayload };
-        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
-        ({ error: saveError } = await supabase.from('books').update(retryPayload).eq('id', original.id));
-      }
-
-      if (saveError && isMissingColumnError(saveError) && !replacementCostMissingRef.current) {
-        replacementCostMissingRef.current = true;
-        replacementCostSkipped = true;
-        ({ error: saveError } = await supabase.from('books').update(basePayload).eq('id', original.id));
+        const missingCol = missingColumnName(saveError);
+        if (missingCol === 'cover_thumbnail' && 'cover_thumbnail' in payload) {
+          coverThumbnailMissingRef.current = true;
+          delete payload.cover_thumbnail;
+        } else if (missingCol === 'replacement_cost' && 'replacement_cost' in payload) {
+          replacementCostMissingRef.current = true;
+          replacementCostSkipped = true;
+          delete payload.replacement_cost;
+        } else if ((missingCol === 'cover_image' || missingCol === 'pdf_url') && ('cover_image' in payload || 'pdf_url' in payload)) {
+          coverPdfSkipped = true;
+          delete payload.cover_image;
+          delete payload.pdf_url;
+        } else {
+          break; // Unrecognized column — stop retrying and let the real error surface.
+        }
       }
 
       if (saveError) throw saveError;
