@@ -848,6 +848,13 @@ export default function InventoryPage() {
       if (deleteError) throw deleteError;
 
       showToast(`"${deletingBook.title}" moved to Trash.`);
+      // Removes the row from view the instant the request succeeds, rather
+      // than waiting on fetchBooks() below to round-trip — that refetch
+      // still runs too, to reconcile anything else that changed, but the
+      // user shouldn't have to wait on it (or refresh the page) just to see
+      // the book they explicitly just deleted disappear.
+      const deletedId = deletingBook.id;
+      setBooks((prev) => prev.filter((b) => b.id !== deletedId));
       setDeletingBook(null);
       fetchBooks();
     } catch (err) {
@@ -866,6 +873,7 @@ export default function InventoryPage() {
       if (restoreError) throw restoreError;
 
       showToast(`"${book.title}" restored.`);
+      setBooks((prev) => prev.filter((b) => b.id !== book.id));
       fetchBooks();
     } catch (err) {
       showToast(err.message || 'Failed to restore book.', 'error');
@@ -879,6 +887,12 @@ export default function InventoryPage() {
       if (deleteError) throw deleteError;
 
       showToast(`"${permaDeleteBook.title}" permanently deleted.`);
+      // Same instant-removal reasoning as handleConfirmDelete above — the
+      // book is confirmed gone from Supabase at this point, no reason to
+      // make the user wait on a refetch (or a manual page refresh) to stop
+      // seeing it in Trash.
+      const deletedId = permaDeleteBook.id;
+      setBooks((prev) => prev.filter((b) => b.id !== deletedId));
       setPermaDeleteBook(null);
       fetchBooks();
     } catch (err) {
