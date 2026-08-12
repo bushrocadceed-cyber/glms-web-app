@@ -106,8 +106,12 @@ export async function createLoan(bookId, memberId, dueDate) {
 // recalculated here. Defaults (0, false) cover a plain on-time return, or
 // any caller that doesn't go through that modal.
 export async function returnLoan(loanId, { fineAmount = 0, finePaid = false } = {}) {
+  // Parameter name is loan_id, not p_loan_id — confirmed against the live
+  // database (a p_loan_id call 404s with PGRST202 and a "Perhaps you meant
+  // ... return_loan(loan_id)" hint). The function itself does exist and
+  // works; only the parameter name this client sent was wrong.
   const { data, error } = await supabase.rpc('return_loan', {
-    p_loan_id: loanId,
+    loan_id: loanId,
   });
 
   if (error) throw error;

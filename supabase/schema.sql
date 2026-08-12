@@ -136,8 +136,11 @@ end;
 $$;
 
 -- Marks a loan returned and restores the copy, capped at total_copies so a
--- miscount can never push a book "above 100% available".
-create or replace function public.return_loan(p_loan_id uuid)
+-- miscount can never push a book "above 100% available". Parameter is named
+-- loan_id (not the p_-prefixed style used by create_loan above) to match
+-- what's actually deployed — the client (loanService.js's returnLoan) calls
+-- this by name, and PostgREST's RPC matching is name-sensitive.
+create or replace function public.return_loan(loan_id uuid)
 returns void
 language plpgsql
 security definer
@@ -146,13 +149,13 @@ as $$
 declare
   v_book_id uuid;
 begin
-  select book_id into v_book_id from public.loans where id = p_loan_id and return_date is null;
+  select book_id into v_book_id from public.loans where id = loan_id and return_date is null;
 
   if v_book_id is null then
-    raise exception 'Loan % not found or already returned', p_loan_id;
+    raise exception 'Loan % not found or already returned', loan_id;
   end if;
 
-  update public.loans set return_date = now() where id = p_loan_id;
+  update public.loans set return_date = now() where id = loan_id;
 
   update public.books
   set available_copies = least(total_copies, available_copies + 1),
