@@ -1,5 +1,16 @@
 import { supabase } from '../lib/supabaseClient';
 
+// Excludes cover_image/pdf_url — same reasoning as InventoryPage.jsx's own
+// list fetch: those columns store the whole file as base64 text (up to
+// ~2MB/~4MB each), and selecting them for every row on every page load
+// makes the response grow without bound as more books get covers/PDFs
+// attached. Confirmed live: with select('*'), this exact query didn't even
+// finish downloading in 60 seconds. Neither column is used by anything
+// that lists books (Check-out modal, dashboard counts) — only the
+// Inventory edit modal needs the real bytes, and it already fetches them
+// on demand for one book at a time.
+const BOOK_LIST_COLUMNS = 'id, title, author, isbn, genre, total_copies, available_copies, status, created_at';
+
 export async function getTotalBooksCount() {
   const { count, error } = await supabase
     .from('books')
@@ -24,7 +35,7 @@ export async function getAvailableBooksCount() {
 export async function getBooks() {
   const { data, error } = await supabase
     .from('books')
-    .select('*')
+    .select(BOOK_LIST_COLUMNS)
     .eq('is_deleted', false)
     .order('created_at', { ascending: false });
 
@@ -35,7 +46,7 @@ export async function getBooks() {
 export async function getDeletedBooks() {
   const { data, error } = await supabase
     .from('books')
-    .select('*')
+    .select(BOOK_LIST_COLUMNS)
     .eq('is_deleted', true)
     .order('created_at', { ascending: false });
 
@@ -85,16 +96,40 @@ function sanitizeSearchTerm(term) {
   return term.replace(/[(),]/g, '').trim();
 }
 
+// Same bloat risk as BOOK_LIST_COLUMNS above, just capped by `limit(5)`
+// instead of the whole table — up to 5 full-size covers is still enough to
+// make the search dropdown feel broken. Uses cover_thumbnail (the small,
+// resized-at-upload copy InventoryPage.jsx generates — see its own
+// resizeToThumbnailDataUrl) instead of cover_image, with the same
+// missing-column fallback used throughout this project for that column,
+// since it isn't guaranteed to exist on every database yet.
+let coverThumbnailColumnMissing = false;
+
 export async function searchBooks(term) {
   const safeTerm = sanitizeSearchTerm(term);
   if (!safeTerm) return [];
 
-  const { data, error } = await supabase
+  const filter = `title.ilike.%${safeTerm}%,author.ilike.%${safeTerm}%,isbn.ilike.%${safeTerm}%`;
+  const columns = coverThumbnailColumnMissing
+    ? 'id, title, author, isbn'
+    : 'id, title, author, isbn, cover_thumbnail';
+
+  let { data, error } = await supabase
     .from('books')
-    .select('id, title, author, isbn, cover_image')
+    .select(columns)
     .eq('is_deleted', false)
-    .or(`title.ilike.%${safeTerm}%,author.ilike.%${safeTerm}%,isbn.ilike.%${safeTerm}%`)
+    .or(filter)
     .limit(5);
+
+  if (error && !coverThumbnailColumnMissing && (error.code === 'PGRST204' || error.code === '42703')) {
+    coverThumbnailColumnMissing = true;
+    ({ data, error } = await supabase
+      .from('books')
+      .select('id, title, author, isbn')
+      .eq('is_deleted', false)
+      .or(filter)
+      .limit(5));
+  }
 
   if (error) throw error;
   return data;

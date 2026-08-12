@@ -111,8 +111,8 @@ export default function GlobalSearch() {
                   className="flex w-full items-center gap-3 px-4 py-2 text-left hover:bg-primary-50"
                 >
                   <div className="flex h-9 w-7 shrink-0 items-center justify-center overflow-hidden rounded bg-slate-100">
-                    {book.cover_image ? (
-                      <img src={book.cover_image} alt="" className="h-full w-full object-cover" />
+                    {book.cover_thumbnail ? (
+                      <img src={book.cover_thumbnail} alt="" className="h-full w-full object-cover" />
                     ) : (
                       <BookImage className="h-4 w-4 text-slate-400" />
                     )}
