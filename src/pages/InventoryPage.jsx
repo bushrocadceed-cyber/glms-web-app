@@ -16,8 +16,8 @@ import { supabase } from '../lib/supabaseClient';
 import { useToast } from '../context/ToastContext';
 import { logUserActivity } from '../services/activityLogService';
 
-const EMPTY_ADD_FORM = { title: '', author: '', isbn: '', total_copies: '1', category: '' };
-const EMPTY_EDIT_FORM = { title: '', author: '', isbn: '', total_copies: '1', category: '' };
+const EMPTY_ADD_FORM = { title: '', author: '', isbn: '', total_copies: '1', category: '', replacement_cost: '' };
+const EMPTY_EDIT_FORM = { title: '', author: '', isbn: '', total_copies: '1', category: '', replacement_cost: '' };
 
 // Files are embedded as base64 data URLs directly in the books row — no
 // Supabase Storage bucket involved, so there's nothing to fail with "Bucket
@@ -67,13 +67,17 @@ function BookCoverThumb({ src, size = 'sm' }) {
   );
 }
 
-// PostgREST rejects an insert/update outright if the payload references any
-// column the schema cache doesn't know about — it won't save the other,
-// valid fields either. So rather than block the whole save on that, callers
-// detect this specific error and retry with the cover/PDF fields stripped
-// out, so title/author/isbn/copies still save.
+// PostgREST rejects an insert/update/select outright if it references any
+// column the schema cache doesn't know about — an insert/update won't save
+// the other, valid fields either. So rather than block on that, callers
+// detect this specific error and retry with the optional field(s) stripped
+// out, so title/author/isbn/copies still save (or load). PGRST204 is
+// PostgREST's own "not in the schema cache" code, seen on insert/update/
+// select payloads; 42703 is the raw Postgres "column does not exist" code,
+// seen when a column is referenced in a filter — checking both covers every
+// shape of request in this file.
 function isMissingColumnError(err) {
-  return err?.code === 'PGRST204';
+  return err?.code === 'PGRST204' || err?.code === '42703';
 }
 
 export default function InventoryPage() {
@@ -112,6 +116,15 @@ export default function InventoryPage() {
   // in-flight call runs that queued fetch itself the moment it finishes.
   const isFetchingRef = useRef(false);
   const refetchQueuedRef = useRef(false);
+
+  // Whether books.replacement_cost is known missing this session — checked
+  // (and possibly set) by both fetchBooksNow below and the Add/Edit submit
+  // handlers, so whichever one learns it first saves the other a doomed
+  // request too. Starts optimistic (include it, self-correct once on
+  // failure) rather than pessimistic, since this ref is scoped to this one
+  // page/session rather than firing on every page load app-wide — see
+  // fetchBooksNow's own comment for why that trade-off is fine here.
+  const replacementCostMissingRef = useRef(false);
 
   const [view, setView] = useState('active'); // 'active' | 'trash' — every book lives in exactly one
   const [books, setBooks] = useState([]);
@@ -161,17 +174,31 @@ export default function InventoryPage() {
     let nextBooks = [];
     let nextPdfIds = new Set();
 
+    const baseColumns =
+      'id, title, author, isbn, genre, total_copies, available_copies, status, created_at, cover_image';
+
     try {
-      const [{ data: rows, error: rowsError }, { data: pdfRows, error: pdfError }] = await Promise.all([
+      const columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
+
+      let [{ data: rows, error: rowsError }, { data: pdfRows, error: pdfError }] = await Promise.all([
         supabase
           .from('books')
-          .select(
-            'id, title, author, isbn, genre, total_copies, available_copies, status, created_at, cover_image'
-          )
+          .select(columns)
           .eq('is_deleted', isTrash)
           .order('created_at', { ascending: false }),
         supabase.from('books').select('id').eq('is_deleted', isTrash).not('pdf_url', 'is', null),
       ]);
+
+      // Only the rows query ever references replacement_cost — retry just
+      // that one in place, once, rather than the whole Promise.all pair.
+      if (rowsError && !replacementCostMissingRef.current && isMissingColumnError(rowsError)) {
+        replacementCostMissingRef.current = true;
+        ({ data: rows, error: rowsError } = await supabase
+          .from('books')
+          .select(baseColumns)
+          .eq('is_deleted', isTrash)
+          .order('created_at', { ascending: false }));
+      }
 
       if (rowsError) throw rowsError;
       if (pdfError) throw pdfError;
@@ -314,6 +341,13 @@ export default function InventoryPage() {
       nextErrors.total_copies = 'Total copies must be a whole number, 0 or greater.';
     }
 
+    if (addForm.replacement_cost.trim()) {
+      const cost = Number(addForm.replacement_cost);
+      if (!Number.isFinite(cost) || cost < 0) {
+        nextErrors.replacement_cost = 'Enter a valid, non-negative amount.';
+      }
+    }
+
     setAddFormErrors((prev) => ({ ...prev, ...nextErrors }));
     return Object.keys(nextErrors).length === 0;
   }
@@ -326,6 +360,8 @@ export default function InventoryPage() {
     setAddSubmitting(true);
     const totalCopies = Number(addForm.total_copies);
     const attachingFiles = Boolean(addCoverDataUrl || addPdfDataUrl);
+    // Optional, defaults to 0 when left blank.
+    const replacementCost = addForm.replacement_cost.trim() ? Number(addForm.replacement_cost) : 0;
 
     const basePayload = {
       title: addForm.title,
@@ -338,18 +374,28 @@ export default function InventoryPage() {
     };
 
     try {
-      // Try including the cover/PDF fields first — only falls back to the
-      // plain payload if the database doesn't have those columns yet, so a
-      // book always saves even when covers/PDFs aren't set up.
-      let { error: saveError } = await supabase.from('books').insert({
-        ...basePayload,
-        cover_image: addCoverDataUrl,
-        pdf_url: addPdfDataUrl,
-      });
+      // Try including replacement_cost + cover/PDF first — only falls back
+      // if the database is missing one of those optional columns, so a book
+      // always saves even when they aren't set up. replacement_cost is
+      // dropped independently of cover/pdf (see the second retry below) so
+      // a database missing just one of them doesn't lose the other.
+      const fullPayload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
+      if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
+
+      let { error: saveError } = await supabase.from('books').insert(fullPayload);
       let coverPdfSkipped = false;
+      let replacementCostSkipped = false;
 
       if (saveError && isMissingColumnError(saveError)) {
         coverPdfSkipped = true;
+        const retryPayload = { ...basePayload };
+        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
+        ({ error: saveError } = await supabase.from('books').insert(retryPayload));
+      }
+
+      if (saveError && isMissingColumnError(saveError) && !replacementCostMissingRef.current) {
+        replacementCostMissingRef.current = true;
+        replacementCostSkipped = true;
         ({ error: saveError } = await supabase.from('books').insert(basePayload));
       }
 
@@ -362,6 +408,11 @@ export default function InventoryPage() {
       if (coverPdfSkipped && attachingFiles) {
         showToast(
           'Book added, but the cover/PDF could not be — the database is missing those columns. Ask an admin to run the setup SQL, then edit this book to attach them.',
+          'error'
+        );
+      } else if (replacementCostSkipped && replacementCost > 0) {
+        showToast(
+          'Book added, but the replacement cost could not be — the database is missing that column. Ask an admin to run supabase/book_replacement_cost_schema.sql, then edit this book to set it.',
           'error'
         );
       } else {
@@ -398,6 +449,7 @@ export default function InventoryPage() {
       isbn: book.isbn ?? '',
       total_copies: String(book.total_copies ?? 1),
       category: book.genre ?? '',
+      replacement_cost: book.replacement_cost != null ? String(book.replacement_cost) : '',
     });
     setFormErrors({});
     setCoverDataUrl(book.cover_image ?? null); // already in the list row
@@ -481,6 +533,13 @@ export default function InventoryPage() {
       nextErrors.total_copies = 'Total copies must be a whole number, 0 or greater.';
     }
 
+    if (form.replacement_cost.trim()) {
+      const cost = Number(form.replacement_cost);
+      if (!Number.isFinite(cost) || cost < 0) {
+        nextErrors.replacement_cost = 'Enter a valid, non-negative amount.';
+      }
+    }
+
     setFormErrors((prev) => ({ ...prev, ...nextErrors }));
     return Object.keys(nextErrors).length === 0;
   }
@@ -495,6 +554,7 @@ export default function InventoryPage() {
     const coverImageUrl = coverDataUrl;
     const pdfUrl = pdfDataUrl;
     const attachingFiles = Boolean(coverImageUrl || pdfUrl);
+    const replacementCost = form.replacement_cost.trim() ? Number(form.replacement_cost) : 0;
 
     try {
       const original = editingBook;
@@ -516,14 +576,23 @@ export default function InventoryPage() {
         status: newAvailable <= 0 ? 'checked_out' : 'available',
       };
 
-      let { error: saveError } = await supabase
-        .from('books')
-        .update({ ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl })
-        .eq('id', original.id);
+      const fullPayload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
+      if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
+
+      let { error: saveError } = await supabase.from('books').update(fullPayload).eq('id', original.id);
       let coverPdfSkipped = false;
+      let replacementCostSkipped = false;
 
       if (saveError && isMissingColumnError(saveError)) {
         coverPdfSkipped = true;
+        const retryPayload = { ...basePayload };
+        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
+        ({ error: saveError } = await supabase.from('books').update(retryPayload).eq('id', original.id));
+      }
+
+      if (saveError && isMissingColumnError(saveError) && !replacementCostMissingRef.current) {
+        replacementCostMissingRef.current = true;
+        replacementCostSkipped = true;
         ({ error: saveError } = await supabase.from('books').update(basePayload).eq('id', original.id));
       }
 
@@ -532,6 +601,11 @@ export default function InventoryPage() {
       if (coverPdfSkipped && attachingFiles) {
         showToast(
           'Book saved, but the cover/PDF could not be — the database is missing those columns. Ask an admin to run the setup SQL, then edit this book again to attach them.',
+          'error'
+        );
+      } else if (replacementCostSkipped && replacementCost > 0) {
+        showToast(
+          'Book saved, but the replacement cost could not be — the database is missing that column. Ask an admin to run supabase/book_replacement_cost_schema.sql.',
           'error'
         );
       } else {
@@ -678,6 +752,7 @@ export default function InventoryPage() {
                     'Author',
                     'ISBN',
                     'Category',
+                    'Replacement Cost',
                     'Total Copies',
                     'Available Copies',
                     'Actions',
@@ -696,7 +771,7 @@ export default function InventoryPage() {
               <tbody className="divide-y divide-slate-100">
                 {loading && (
                   <tr>
-                    <td colSpan={8} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td colSpan={9} className="px-6 py-10 text-center text-sm text-slate-500">
                       <div className="flex items-center justify-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
                         Loading inventory…
@@ -707,7 +782,7 @@ export default function InventoryPage() {
 
                 {!loading && filteredBooks.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-6 py-10 text-center text-sm text-slate-500">
+                    <td colSpan={9} className="px-6 py-10 text-center text-sm text-slate-500">
                       {view === 'trash' ? 'Trash is empty.' : 'No books found in inventory yet.'}
                     </td>
                   </tr>
@@ -738,6 +813,9 @@ export default function InventoryPage() {
                           ) : (
                             '—'
                           )}
+                        </td>
+                        <td className="px-6 py-4 text-sm text-slate-600">
+                          {book.replacement_cost != null ? `$${Number(book.replacement_cost).toFixed(2)}` : '—'}
                         </td>
                         <td className="px-6 py-4 text-sm text-slate-600">{book.total_copies ?? '—'}</td>
                         <td
@@ -886,6 +964,36 @@ export default function InventoryPage() {
                   list="book-categories"
                   className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-primary-600 focus:outline-none focus:ring-1 focus:ring-primary-600"
                 />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-700">
+                  Replacement Cost ($) <span className="font-normal text-slate-400">(optional)</span>
+                </label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">
+                    $
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={addForm.replacement_cost}
+                    onChange={(e) => handleAddChange('replacement_cost', e.target.value)}
+                    placeholder="0.00"
+                    className={`w-full rounded-lg border py-2 pl-7 pr-3 text-sm focus:outline-none focus:ring-1 ${
+                      addFormErrors.replacement_cost
+                        ? 'border-red-400 focus:border-red-500 focus:ring-red-500'
+                        : 'border-slate-300 focus:border-primary-600 focus:ring-primary-600'
+                    }`}
+                  />
+                </div>
+                {addFormErrors.replacement_cost && (
+                  <p className="mt-1 text-xs text-red-600">{addFormErrors.replacement_cost}</p>
+                )}
+                <p className="mt-1.5 text-xs text-slate-400">
+                  What a member is charged if this book is lost or damaged. Defaults to $0.00.
+                </p>
               </div>
 
               <div>
@@ -1054,6 +1162,36 @@ export default function InventoryPage() {
                   list="book-categories"
                   className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-primary-600 focus:outline-none focus:ring-1 focus:ring-primary-600"
                 />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-700">
+                  Replacement Cost ($) <span className="font-normal text-slate-400">(optional)</span>
+                </label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">
+                    $
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={form.replacement_cost}
+                    onChange={(e) => setForm((prev) => ({ ...prev, replacement_cost: e.target.value }))}
+                    placeholder="0.00"
+                    className={`w-full rounded-lg border py-2 pl-7 pr-3 text-sm focus:outline-none focus:ring-1 ${
+                      formErrors.replacement_cost
+                        ? 'border-red-400 focus:border-red-500 focus:ring-red-500'
+                        : 'border-slate-300 focus:border-primary-600 focus:ring-primary-600'
+                    }`}
+                  />
+                </div>
+                {formErrors.replacement_cost && (
+                  <p className="mt-1 text-xs text-red-600">{formErrors.replacement_cost}</p>
+                )}
+                <p className="mt-1.5 text-xs text-slate-400">
+                  What a member is charged if this book is lost or damaged. Defaults to $0.00.
+                </p>
               </div>
 
               <div>

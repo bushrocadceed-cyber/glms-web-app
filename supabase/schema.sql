@@ -181,14 +181,20 @@ alter table public.loans add column if not exists fine_amount numeric not null d
 alter table public.loans add column if not exists fine_paid boolean not null default false;
 
 -- =========================================================================
--- PART 3 — avatar storage (profiles)
+-- PART 3 — replacement cost (books)
+-- =========================================================================
+-- What a member is charged if they lose or damage a copy.
+alter table public.books add column if not exists replacement_cost numeric not null default 0;
+
+-- =========================================================================
+-- PART 4 — avatar storage (profiles)
 -- =========================================================================
 -- Base64 data URL stored directly in a text column — no Storage bucket
 -- involved, matching how books.cover_image/pdf_url already work.
 alter table public.profiles add column if not exists avatar_url text;
 
 -- =========================================================================
--- PART 4 — activity_logs (audit trail)
+-- PART 5 — activity_logs (audit trail)
 -- =========================================================================
 create table if not exists public.activity_logs (
   id uuid primary key default gen_random_uuid(),
@@ -202,7 +208,7 @@ create table if not exists public.activity_logs (
 );
 
 -- =========================================================================
--- PART 5 — indices
+-- PART 6 — indices
 -- =========================================================================
 create index if not exists books_is_deleted_idx on public.books (is_deleted);
 create index if not exists books_isbn_idx on public.books (isbn);
@@ -216,7 +222,7 @@ create index if not exists activity_logs_created_at_idx on public.activity_logs 
 create index if not exists activity_logs_user_id_idx on public.activity_logs (user_id);
 
 -- =========================================================================
--- PART 6 — Row Level Security
+-- PART 7 — Row Level Security
 -- =========================================================================
 -- Every policy below gates on auth.uid() is not null / auth.uid() = id
 -- rather than `to authenticated` role-scoping — auth.uid() reads the JWT's
