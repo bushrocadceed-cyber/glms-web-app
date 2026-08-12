@@ -27,6 +27,19 @@ const EMPTY_EDIT_FORM = { title: '', author: '', isbn: '', total_copies: '1', ca
 const MAX_COVER_BYTES = 1.5 * 1024 * 1024; // 1.5MB raw (~2MB encoded)
 const MAX_PDF_BYTES = 3 * 1024 * 1024; // 3MB raw (~4MB encoded)
 
+// Belt-and-suspenders on top of the try/finally below: that guarantees
+// setLoading(false) runs once the request settles, but a genuinely hung
+// connection (rare — DNS stall, a proxy that accepts a connection and then
+// goes silent, etc.) can in principle never settle at all, which no
+// finally block can protect against. This aborts the request outright once
+// the deadline passes, which both frees the UI *and* actually stops the
+// request, instead of a bare timer that flips a flag while the original
+// request keeps running in the background. 8s rather than a tighter 3s —
+// long enough that a normal-but-not-instant load never gets cut off into a
+// false "no books" empty state, short enough that the page can never look
+// permanently stuck.
+const FETCH_TIMEOUT_MS = 8000;
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -210,6 +223,11 @@ export default function InventoryPage() {
 
     const baseColumns = 'id, title, author, isbn, genre, total_copies, available_copies, status, created_at';
 
+    // Actually cancels the in-flight request when the deadline passes
+    // (rather than just abandoning it) — see FETCH_TIMEOUT_MS above.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
     try {
       const columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
 
@@ -222,20 +240,33 @@ export default function InventoryPage() {
           .from('books')
           .select(columns)
           .eq('is_deleted', isTrash)
-          .order('created_at', { ascending: false }),
-        supabase.from('books').select('id').eq('is_deleted', isTrash).not('cover_image', 'is', null),
-        supabase.from('books').select('id').eq('is_deleted', isTrash).not('pdf_url', 'is', null),
+          .order('created_at', { ascending: false })
+          .abortSignal(controller.signal),
+        supabase
+          .from('books')
+          .select('id')
+          .eq('is_deleted', isTrash)
+          .not('cover_image', 'is', null)
+          .abortSignal(controller.signal),
+        supabase
+          .from('books')
+          .select('id')
+          .eq('is_deleted', isTrash)
+          .not('pdf_url', 'is', null)
+          .abortSignal(controller.signal),
       ]);
 
       // Only the rows query ever references replacement_cost — retry just
       // that one in place, once, rather than the whole Promise.all trio.
+      // Still covered by the same controller/deadline as the first attempt.
       if (rowsError && !replacementCostMissingRef.current && isMissingColumnError(rowsError)) {
         replacementCostMissingRef.current = true;
         ({ data: rows, error: rowsError } = await supabase
           .from('books')
           .select(baseColumns)
           .eq('is_deleted', isTrash)
-          .order('created_at', { ascending: false }));
+          .order('created_at', { ascending: false })
+          .abortSignal(controller.signal));
       }
 
       if (rowsError) throw rowsError;
@@ -245,14 +276,20 @@ export default function InventoryPage() {
       nextBooks = rows ?? [];
       nextCoverIds = new Set((coverRows ?? []).map((r) => r.id));
       nextPdfIds = new Set((pdfRows ?? []).map((r) => r.id));
-    } catch {
-      // A failed or slow fetch never leaves the page stuck or shows an
-      // error wall — it just falls back to an empty books array, which the
-      // render below already displays as a plain "No books found" message.
+    } catch (err) {
+      // Logged (unlike the earlier version of this function, which
+      // deliberately swallowed the error silently to keep the console
+      // clean for the *expected* missing-column case) — that trade-off
+      // made a genuine, unexpected failure indistinguishable from a normal
+      // one. Timeouts land here too: an aborted fetch rejects, so this is
+      // also what turns "the 8s deadline passed" into a clean empty state
+      // rather than an unhandled rejection.
+      console.error('Failed to fetch books:', err);
       nextBooks = [];
       nextCoverIds = new Set();
       nextPdfIds = new Set();
     } finally {
+      clearTimeout(timeoutId);
       isFetchingRef.current = false;
       if (fetchTokenRef.current === myToken) {
         setBooks(nextBooks);
