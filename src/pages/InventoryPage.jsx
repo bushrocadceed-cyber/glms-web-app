@@ -167,20 +167,27 @@ export default function InventoryPage() {
   const [submitting, setSubmitting] = useState(false);
 
   const [coverDataUrl, setCoverDataUrl] = useState(null);
+  const [coverBookIds, setCoverBookIds] = useState(() => new Set());
   const [pdfDataUrl, setPdfDataUrl] = useState(null);
   const [pdfFileName, setPdfFileName] = useState(null);
   const [pdfBookIds, setPdfBookIds] = useState(() => new Set());
   const [readingPdf, setReadingPdf] = useState(false);
-  const [loadingExistingPdf, setLoadingExistingPdf] = useState(false);
+  const [loadingExistingAssets, setLoadingExistingAssets] = useState(false);
 
-  // pdf_url stores the whole PDF as base64 text (hundreds of KB to a few MB
-  // each) — selecting it for every row on every page load means the list
-  // payload grows without bound as more books get PDFs attached. The list
-  // only ever needs to know *whether* a PDF exists (to show the Read
-  // button), never its content, so the bulk query excludes pdf_url
-  // entirely; a second, tiny query just asks which ids have a non-null
-  // pdf_url. The actual PDF bytes are fetched only for one row at a time,
-  // on demand — see openEditModal and openReadPdf below.
+  // cover_image and pdf_url both store the whole file as base64 text —
+  // cover_image up to ~2MB encoded per book (MAX_COVER_BYTES), pdf_url up
+  // to ~4MB (MAX_PDF_BYTES). Selecting either for every row on every page
+  // load means the list payload grows without bound as more books get
+  // covers/PDFs attached — confirmed live: with only 4 active books, that
+  // payload was already multiple megabytes and took the list query well
+  // past what feels instant, which is exactly what showed up as "hangs
+  // indefinitely, no books or empty state ever appears" (the request
+  // hadn't actually failed, it was just still downloading). Neither
+  // column's content is needed by the list itself — the table only shows
+  // *whether* a cover/PDF exists (for the thumbnail fallback and the Read
+  // button) — so the bulk query excludes both entirely; two tiny id-only
+  // queries ask which rows have one. The actual bytes are fetched only for
+  // one row at a time, on demand — see openEditModal and openReadPdf below.
   //
   // setLoading(false) lives in `finally`, unconditionally, on its own line,
   // with nothing else in that block that could delay or skip it — so it
@@ -199,24 +206,29 @@ export default function InventoryPage() {
     const isTrash = view === 'trash';
     let nextBooks = [];
     let nextPdfIds = new Set();
+    let nextCoverIds = new Set();
 
-    const baseColumns =
-      'id, title, author, isbn, genre, total_copies, available_copies, status, created_at, cover_image';
+    const baseColumns = 'id, title, author, isbn, genre, total_copies, available_copies, status, created_at';
 
     try {
       const columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
 
-      let [{ data: rows, error: rowsError }, { data: pdfRows, error: pdfError }] = await Promise.all([
+      let [
+        { data: rows, error: rowsError },
+        { data: coverRows, error: coverError },
+        { data: pdfRows, error: pdfError },
+      ] = await Promise.all([
         supabase
           .from('books')
           .select(columns)
           .eq('is_deleted', isTrash)
           .order('created_at', { ascending: false }),
+        supabase.from('books').select('id').eq('is_deleted', isTrash).not('cover_image', 'is', null),
         supabase.from('books').select('id').eq('is_deleted', isTrash).not('pdf_url', 'is', null),
       ]);
 
       // Only the rows query ever references replacement_cost — retry just
-      // that one in place, once, rather than the whole Promise.all pair.
+      // that one in place, once, rather than the whole Promise.all trio.
       if (rowsError && !replacementCostMissingRef.current && isMissingColumnError(rowsError)) {
         replacementCostMissingRef.current = true;
         ({ data: rows, error: rowsError } = await supabase
@@ -227,20 +239,24 @@ export default function InventoryPage() {
       }
 
       if (rowsError) throw rowsError;
+      if (coverError) throw coverError;
       if (pdfError) throw pdfError;
 
       nextBooks = rows ?? [];
+      nextCoverIds = new Set((coverRows ?? []).map((r) => r.id));
       nextPdfIds = new Set((pdfRows ?? []).map((r) => r.id));
     } catch {
       // A failed or slow fetch never leaves the page stuck or shows an
       // error wall — it just falls back to an empty books array, which the
       // render below already displays as a plain "No books found" message.
       nextBooks = [];
+      nextCoverIds = new Set();
       nextPdfIds = new Set();
     } finally {
       isFetchingRef.current = false;
       if (fetchTokenRef.current === myToken) {
         setBooks(nextBooks);
+        setCoverBookIds(nextCoverIds);
         setPdfBookIds(nextPdfIds);
         setLoading(false);
       }
@@ -478,21 +494,30 @@ export default function InventoryPage() {
       replacement_cost: book.replacement_cost != null ? String(book.replacement_cost) : '',
     });
     setFormErrors({});
-    setCoverDataUrl(book.cover_image ?? null); // already in the list row
     setEditingBook(book);
 
-    // pdf_url isn't in the list row on purpose (see fetchBooksAttempt) — if
-    // this book has one, fetch it now so Save Changes doesn't wipe it out
-    // by sending pdf_url: null when nothing was actually meant to change.
+    // Neither cover_image nor pdf_url is in the list row on purpose (see
+    // fetchBooksNow) — if this book has either, fetch them now, together,
+    // so Save Changes doesn't wipe one out by sending null when nothing
+    // was actually meant to change.
+    const hasCover = coverBookIds.has(book.id);
     const hasPdf = pdfBookIds.has(book.id);
+    setCoverDataUrl(null);
     setPdfFileName(hasPdf ? 'Current PDF attached' : null);
     setPdfDataUrl(null);
 
-    if (hasPdf) {
-      setLoadingExistingPdf(true);
-      const { data, error } = await supabase.from('books').select('pdf_url').eq('id', book.id).single();
-      if (!error) setPdfDataUrl(data.pdf_url);
-      setLoadingExistingPdf(false);
+    if (hasCover || hasPdf) {
+      setLoadingExistingAssets(true);
+      const { data, error } = await supabase
+        .from('books')
+        .select('cover_image, pdf_url')
+        .eq('id', book.id)
+        .single();
+      if (!error) {
+        if (hasCover) setCoverDataUrl(data.cover_image);
+        if (hasPdf) setPdfDataUrl(data.pdf_url);
+      }
+      setLoadingExistingAssets(false);
     }
   }
 
@@ -840,6 +865,11 @@ export default function InventoryPage() {
                         }`}
                       >
                         <td className="px-6 py-4">
+                          {/* book.cover_image is never populated here on purpose
+                              (see fetchBooksNow) — this always shows the
+                              placeholder icon in the list, regardless of
+                              coverBookIds; the real image loads on demand in
+                              the Edit modal. */}
                           <BookCoverThumb src={book.cover_image} />
                         </td>
                         <td className="px-6 py-4 text-sm font-medium text-slate-900">{book.title}</td>
@@ -1311,10 +1341,10 @@ export default function InventoryPage() {
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting || loadingExistingPdf}
+                  disabled={submitting || loadingExistingAssets}
                   className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-semibold text-white hover:bg-primary-700 disabled:opacity-60"
                 >
-                  {loadingExistingPdf ? 'Loading…' : submitting ? 'Saving…' : 'Save Changes'}
+                  {loadingExistingAssets ? 'Loading…' : submitting ? 'Saving…' : 'Save Changes'}
                 </button>
               </div>
             </form>
