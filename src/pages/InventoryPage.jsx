@@ -49,6 +49,38 @@ function readFileAsDataUrl(file) {
   });
 }
 
+// Generates the small cover_thumbnail saved alongside the full-size
+// cover_image — accepts either a File (a fresh upload) or a data URL
+// string (an existing cover being backfilled, see openEditModal), drawing
+// it onto a canvas at a small fixed size and re-encoding as compressed
+// JPEG. This is what keeps the Inventory list query safe: a real book
+// cover at these dimensions/quality typically comes out well under 20KB,
+// vs. up to ~2MB for the untouched original.
+function resizeToThumbnailDataUrl(source, { maxDimension = 160, quality = 0.75 } = {}) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = typeof source === 'string' ? null : URL.createObjectURL(source);
+
+    img.onload = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      const scale = Math.min(1, maxDimension / Math.max(img.width, img.height));
+      const width = Math.max(1, Math.round(img.width * scale));
+      const height = Math.max(1, Math.round(img.height * scale));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      reject(new Error('Failed to generate thumbnail.'));
+    };
+    img.src = objectUrl ?? source;
+  });
+}
+
 // Cover images are stored as data: URLs, so a "broken image" here means
 // corrupt/unsupported data rather than a dead link — either way, fall back
 // to the placeholder icon instead of a broken-image box.
@@ -128,6 +160,7 @@ export default function InventoryPage() {
   const [addForm, setAddForm] = useState(EMPTY_ADD_FORM);
   const [addFormErrors, setAddFormErrors] = useState({});
   const [addCoverDataUrl, setAddCoverDataUrl] = useState(null);
+  const [addCoverThumbnail, setAddCoverThumbnail] = useState(null);
   const [addPdfDataUrl, setAddPdfDataUrl] = useState(null);
   const [addPdfFileName, setAddPdfFileName] = useState(null);
   const [addSubmitting, setAddSubmitting] = useState(false);
@@ -164,6 +197,9 @@ export default function InventoryPage() {
   // page/session rather than firing on every page load app-wide — see
   // fetchBooksNow's own comment for why that trade-off is fine here.
   const replacementCostMissingRef = useRef(false);
+  // Same idea, for books.cover_thumbnail (see the Cover column's on-demand
+  // thumbnail generation below).
+  const coverThumbnailMissingRef = useRef(false);
 
   const [view, setView] = useState('active'); // 'active' | 'trash' — every book lives in exactly one
   const [books, setBooks] = useState([]);
@@ -180,6 +216,7 @@ export default function InventoryPage() {
   const [submitting, setSubmitting] = useState(false);
 
   const [coverDataUrl, setCoverDataUrl] = useState(null);
+  const [coverThumbnail, setCoverThumbnail] = useState(null);
   const [coverBookIds, setCoverBookIds] = useState(() => new Set());
   const [pdfDataUrl, setPdfDataUrl] = useState(null);
   const [pdfFileName, setPdfFileName] = useState(null);
@@ -229,7 +266,9 @@ export default function InventoryPage() {
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     try {
-      const columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
+      let columns = baseColumns;
+      if (!replacementCostMissingRef.current) columns += ', replacement_cost';
+      if (!coverThumbnailMissingRef.current) columns += ', cover_thumbnail';
 
       let [
         { data: rows, error: rowsError },
@@ -256,9 +295,23 @@ export default function InventoryPage() {
           .abortSignal(controller.signal),
       ]);
 
-      // Only the rows query ever references replacement_cost — retry just
-      // that one in place, once, rather than the whole Promise.all trio.
+      // Only the rows query ever references replacement_cost/cover_thumbnail
+      // — retry just that one in place rather than the whole Promise.all
+      // trio, dropping cover_thumbnail first (the newer column, more likely
+      // to be missing on a database that hasn't run the latest setup SQL
+      // yet) and only then replacement_cost too if it's still failing.
       // Still covered by the same controller/deadline as the first attempt.
+      if (rowsError && !coverThumbnailMissingRef.current && isMissingColumnError(rowsError)) {
+        coverThumbnailMissingRef.current = true;
+        columns = replacementCostMissingRef.current ? baseColumns : `${baseColumns}, replacement_cost`;
+        ({ data: rows, error: rowsError } = await supabase
+          .from('books')
+          .select(columns)
+          .eq('is_deleted', isTrash)
+          .order('created_at', { ascending: false })
+          .abortSignal(controller.signal));
+      }
+
       if (rowsError && !replacementCostMissingRef.current && isMissingColumnError(rowsError)) {
         replacementCostMissingRef.current = true;
         ({ data: rows, error: rowsError } = await supabase
@@ -363,6 +416,7 @@ export default function InventoryPage() {
     setAddForm(EMPTY_ADD_FORM);
     setAddFormErrors({});
     setAddCoverDataUrl(null);
+    setAddCoverThumbnail(null);
     setAddPdfDataUrl(null);
     setAddPdfFileName(null);
     setIsAddModalOpen(true);
@@ -387,7 +441,9 @@ export default function InventoryPage() {
     }
 
     setAddFormErrors((prev) => ({ ...prev, cover_image: undefined }));
-    setAddCoverDataUrl(await readFileAsDataUrl(file));
+    const [dataUrl, thumbnail] = await Promise.all([readFileAsDataUrl(file), resizeToThumbnailDataUrl(file)]);
+    setAddCoverDataUrl(dataUrl);
+    setAddCoverThumbnail(thumbnail);
   }
 
   async function handleAddPdfFileChange(e) {
@@ -453,17 +509,28 @@ export default function InventoryPage() {
     };
 
     try {
-      // Try including replacement_cost + cover/PDF first — only falls back
-      // if the database is missing one of those optional columns, so a book
-      // always saves even when they aren't set up. replacement_cost is
-      // dropped independently of cover/pdf (see the second retry below) so
-      // a database missing just one of them doesn't lose the other.
+      // Try including replacement_cost + cover_thumbnail + cover/PDF first —
+      // only falls back if the database is missing one of those optional
+      // columns, so a book always saves even when they aren't set up.
+      // cover_thumbnail is dropped independently of cover_image/pdf_url
+      // (before them, since it's the newest column and most likely to be
+      // the one a not-yet-updated database is missing), and replacement_cost
+      // independently of both (see the retries below), so a database
+      // missing just one of them doesn't lose the others.
       const fullPayload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
       if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
+      if (!coverThumbnailMissingRef.current) fullPayload.cover_thumbnail = addCoverThumbnail;
 
       let { error: saveError } = await supabase.from('books').insert(fullPayload);
       let coverPdfSkipped = false;
       let replacementCostSkipped = false;
+
+      if (saveError && !coverThumbnailMissingRef.current && isMissingColumnError(saveError)) {
+        coverThumbnailMissingRef.current = true;
+        const retryPayload = { ...basePayload, cover_image: addCoverDataUrl, pdf_url: addPdfDataUrl };
+        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
+        ({ error: saveError } = await supabase.from('books').insert(retryPayload));
+      }
 
       if (saveError && isMissingColumnError(saveError)) {
         coverPdfSkipped = true;
@@ -501,6 +568,7 @@ export default function InventoryPage() {
       setAddForm(EMPTY_ADD_FORM);
       setAddFormErrors({});
       setAddCoverDataUrl(null);
+      setAddCoverThumbnail(null);
       setAddPdfDataUrl(null);
       setAddPdfFileName(null);
       setIsAddModalOpen(false);
@@ -536,10 +604,13 @@ export default function InventoryPage() {
     // Neither cover_image nor pdf_url is in the list row on purpose (see
     // fetchBooksNow) — if this book has either, fetch them now, together,
     // so Save Changes doesn't wipe one out by sending null when nothing
-    // was actually meant to change.
+    // was actually meant to change. cover_thumbnail, by contrast, IS
+    // already in the list row (it's small enough to be safe there), so it
+    // just carries straight over from `book` — no extra fetch needed.
     const hasCover = coverBookIds.has(book.id);
     const hasPdf = pdfBookIds.has(book.id);
     setCoverDataUrl(null);
+    setCoverThumbnail(coverThumbnailMissingRef.current ? null : book.cover_thumbnail ?? null);
     setPdfFileName(hasPdf ? 'Current PDF attached' : null);
     setPdfDataUrl(null);
 
@@ -551,7 +622,21 @@ export default function InventoryPage() {
         .eq('id', book.id)
         .single();
       if (!error) {
-        if (hasCover) setCoverDataUrl(data.cover_image);
+        if (hasCover) {
+          setCoverDataUrl(data.cover_image);
+          // Backfills a thumbnail for covers saved before cover_thumbnail
+          // existed (or before this book's own most recent save started
+          // populating it) — from here on, re-saving this book keeps
+          // cover_image and cover_thumbnail in sync.
+          if (!coverThumbnailMissingRef.current && !book.cover_thumbnail && data.cover_image) {
+            try {
+              setCoverThumbnail(await resizeToThumbnailDataUrl(data.cover_image));
+            } catch {
+              // Best-effort — the list keeps showing the placeholder for
+              // this book until a future save succeeds.
+            }
+          }
+        }
         if (hasPdf) setPdfDataUrl(data.pdf_url);
       }
       setLoadingExistingAssets(false);
@@ -588,7 +673,9 @@ export default function InventoryPage() {
     }
 
     setFormErrors((prev) => ({ ...prev, cover_image: undefined }));
-    setCoverDataUrl(await readFileAsDataUrl(file));
+    const [dataUrl, thumbnail] = await Promise.all([readFileAsDataUrl(file), resizeToThumbnailDataUrl(file)]);
+    setCoverDataUrl(dataUrl);
+    setCoverThumbnail(thumbnail);
   }
 
   async function handlePdfFileChange(e) {
@@ -666,10 +753,18 @@ export default function InventoryPage() {
 
       const fullPayload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
       if (!replacementCostMissingRef.current) fullPayload.replacement_cost = replacementCost;
+      if (!coverThumbnailMissingRef.current) fullPayload.cover_thumbnail = coverThumbnail;
 
       let { error: saveError } = await supabase.from('books').update(fullPayload).eq('id', original.id);
       let coverPdfSkipped = false;
       let replacementCostSkipped = false;
+
+      if (saveError && !coverThumbnailMissingRef.current && isMissingColumnError(saveError)) {
+        coverThumbnailMissingRef.current = true;
+        const retryPayload = { ...basePayload, cover_image: coverImageUrl, pdf_url: pdfUrl };
+        if (!replacementCostMissingRef.current) retryPayload.replacement_cost = replacementCost;
+        ({ error: saveError } = await supabase.from('books').update(retryPayload).eq('id', original.id));
+      }
 
       if (saveError && isMissingColumnError(saveError)) {
         coverPdfSkipped = true;
@@ -902,12 +997,12 @@ export default function InventoryPage() {
                         }`}
                       >
                         <td className="px-6 py-4">
-                          {/* book.cover_image is never populated here on purpose
-                              (see fetchBooksNow) — this always shows the
-                              placeholder icon in the list, regardless of
-                              coverBookIds; the real image loads on demand in
-                              the Edit modal. */}
-                          <BookCoverThumb src={book.cover_image} />
+                          {/* book.cover_thumbnail is the small, resized-at-upload
+                              copy (see resizeToThumbnailDataUrl) — safe to select
+                              for every row. The full-size book.cover_image is
+                              never populated here on purpose (see fetchBooksNow)
+                              and only loads on demand in the Edit modal. */}
+                          <BookCoverThumb src={book.cover_thumbnail} />
                         </td>
                         <td className="px-6 py-4 text-sm font-medium text-slate-900">{book.title}</td>
                         <td className="px-6 py-4 text-sm text-slate-600">{book.author}</td>

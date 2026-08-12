@@ -1,0 +1,13 @@
+-- Superseded by schema.sql, which includes this file's content along with
+-- every table/column/index the project needs. Kept here standalone in case
+-- you ever want to re-apply just this piece on its own.
+--
+-- Adds a small, separate thumbnail for the Inventory table's Cover column.
+-- Deliberately distinct from cover_image (the full-size original, up to
+-- ~2MB base64-encoded): including the full image in the list query is what
+-- caused the Inventory page's "hangs indefinitely" bug (see the
+-- InventoryPage.jsx commit that removed it from the list query). This
+-- column instead holds a client-side-resized, compressed copy — generated
+-- at upload time and expected to be only a few KB — so the list can safely
+-- select it for every row without the payload blowing up again.
+alter table public.books add column if not exists cover_thumbnail text;

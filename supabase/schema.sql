@@ -181,10 +181,17 @@ alter table public.loans add column if not exists fine_amount numeric not null d
 alter table public.loans add column if not exists fine_paid boolean not null default false;
 
 -- =========================================================================
--- PART 3 — replacement cost (books)
+-- PART 3 — book extras (replacement cost, cover thumbnail)
 -- =========================================================================
 -- What a member is charged if they lose or damage a copy.
 alter table public.books add column if not exists replacement_cost numeric not null default 0;
+
+-- Small, separate, resized-at-upload-time copy of the cover for the
+-- Inventory table's list view — deliberately distinct from cover_image
+-- (the full-size original, up to ~2MB base64), which is excluded from the
+-- list query on purpose (see InventoryPage.jsx) since including it there
+-- was the actual cause of that page's "hangs indefinitely" bug.
+alter table public.books add column if not exists cover_thumbnail text;
 
 -- =========================================================================
 -- PART 4 — avatar storage (profiles)
