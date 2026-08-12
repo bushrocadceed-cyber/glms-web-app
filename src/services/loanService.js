@@ -196,13 +196,30 @@ export async function getFines() {
   return { rows: [...liveRows, ...finalizedRows], finesTrackingReady: !areFineColumnsKnownMissing() };
 }
 
-// Used for the Dashboard's stat card — returns 0 (not an error) if the
-// fine_amount/fine_paid columns don't exist yet, so a missing setup step on
-// a brand-new feature never breaks the whole dashboard. Runs on every
-// Dashboard load, so this is typically what teaches the rest of this file
-// whether the columns exist at all.
+// Used for the Dashboard's stat card. Adds two sums that can never double
+// count each other: live-calculated fines on loans that are overdue right
+// now but haven't been returned or manually paid yet (computed straight
+// from due_date, so this half works even before the fine_amount/fine_paid
+// setup SQL has been run — previously this whole function returned a flat
+// 0 until then), plus already-finalized unpaid fines recorded by
+// returnLoan() or markFineAsPaid() on loans that HAVE been returned.
+// markFineAsPaid always writes fine_paid: true in the same update that
+// sets fine_amount, so a still-open loan can never have fine_amount > 0
+// AND fine_paid = false at once — the two queries below can't overlap.
+// Mirrors the same live-vs-finalized split getFines() uses for the Fines
+// report, so the two stay consistent with each other.
 export async function getTotalOutstandingFines() {
-  if (areFineColumnsKnownMissing()) return 0;
+  const { data: overdueLoans, error: overdueError } = await supabase
+    .from('loans')
+    .select('due_date')
+    .is('return_date', null)
+    .lt('due_date', new Date().toISOString());
+
+  const liveTotal = overdueError
+    ? 0
+    : (overdueLoans ?? []).reduce((sum, loan) => sum + computeFine(loan.due_date).amount, 0);
+
+  if (areFineColumnsKnownMissing()) return liveTotal;
 
   const { data, error } = await supabase
     .from('loans')
@@ -212,11 +229,12 @@ export async function getTotalOutstandingFines() {
 
   if (error) {
     recordFineColumnsMissing();
-    return 0;
+    return liveTotal;
   }
 
   recordFineColumnsPresent();
-  return (data ?? []).reduce((sum, row) => sum + Number(row.fine_amount ?? 0), 0);
+  const finalizedTotal = (data ?? []).reduce((sum, row) => sum + Number(row.fine_amount ?? 0), 0);
+  return liveTotal + finalizedTotal;
 }
 
 // Takes the whole fine row (not just an id) because a still-open overdue
