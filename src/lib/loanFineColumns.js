@@ -6,6 +6,15 @@
 // rediscovering the same missing columns over and over.
 let fineColumnsExist = null;
 
+// Learns for free from any select('*') on loans (getAllLoans) rather than
+// waiting for a dedicated probe request — mirrors recordProfileRow in
+// staffContactColumns.js/profileAvatarColumn.js.
+export function recordLoanRow(row) {
+  if (row && fineColumnsExist === null) {
+    fineColumnsExist = Object.prototype.hasOwnProperty.call(row, 'fine_amount');
+  }
+}
+
 export function recordFineColumnsPresent() {
   fineColumnsExist = true;
 }

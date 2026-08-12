@@ -7,7 +7,7 @@ import ReturnBookModal from '../components/loans/ReturnBookModal';
 import { useLoans } from '../hooks/useLoans';
 import { useBooks } from '../hooks/useBooks';
 import { useMembers } from '../hooks/useMembers';
-import { createLoan, renewLoan, returnLoan } from '../services/loanService';
+import { createLoan, markFineAsPaid, renewLoan, returnLoan } from '../services/loanService';
 import { getLoanStatus } from '../lib/loanStatus';
 import { logUserActivity } from '../services/activityLogService';
 import { useToast } from '../context/ToastContext';
@@ -39,6 +39,7 @@ export default function LoansPage() {
   const [returningLoan, setReturningLoan] = useState(null);
   const [returning, setReturning] = useState(false);
   const [renewingId, setRenewingId] = useState(null);
+  const [payingFineId, setPayingFineId] = useState(null);
 
   // Lets the Dashboard's "Borrow Book" quick action deep-link straight into
   // this modal. Consumed once, then cleared from the URL so a page refresh
@@ -117,6 +118,28 @@ export default function LoansPage() {
     }
   }
 
+  // amount is whatever LoansTable's getPayableFine computed — either the
+  // already-finalized fine_amount, or (for a still-open overdue loan with
+  // nothing recorded yet) a live estimate as of today. markFineAsPaid
+  // writes fine_amount and fine_paid together, so a fine can be settled at
+  // the counter at any time, even before the book itself is returned.
+  async function handlePayFine(loan, amount) {
+    setPayingFineId(loan.id);
+    try {
+      await markFineAsPaid({ id: loan.id, fine_amount: amount });
+      showToast(`$${amount.toFixed(2)} fine for "${loan.books?.title ?? 'book'}" marked as paid.`);
+      logUserActivity(
+        'Paid Fine',
+        `${loan.books?.title ?? 'Book'} — ${loan.members?.full_name ?? 'Member'} ($${amount.toFixed(2)})`
+      );
+      refetch();
+    } catch (err) {
+      showToast(err.message || 'Failed to update fine.', 'error');
+    } finally {
+      setPayingFineId(null);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -161,8 +184,10 @@ export default function LoansPage() {
         loading={loading}
         emptyMessage={EMPTY_MESSAGE[tab]}
         renewingId={renewingId}
+        payingFineId={payingFineId}
         onReturn={handleReturn}
         onRenew={handleRenew}
+        onPayFine={handlePayFine}
       />
 
       {showCreateModal && (

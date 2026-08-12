@@ -3,6 +3,7 @@ import {
   areFineColumnsKnownMissing,
   recordFineColumnsMissing,
   recordFineColumnsPresent,
+  recordLoanRow,
 } from '../lib/loanFineColumns';
 import { computeFine } from '../lib/fines';
 
@@ -43,17 +44,21 @@ export async function getActiveLoans() {
 
 // Every loan regardless of status — backs the Loans page, which filters
 // client-side into All/Active/Overdue/Returned (see lib/loanStatus.js) from
-// one fetch rather than a separate query per tab. member_id is included (on
-// top of the embedded members(full_name)) so CreateLoanModal can count a
-// specific member's active loans client-side for the Max Books Per Member
-// check, without a separate query.
+// one fetch rather than a separate query per tab. select('*, ...') rather
+// than an explicit scalar column list: '*' always succeeds regardless of
+// which optional columns exist (fine_amount/fine_paid included, for the
+// Pay Fine action in LoansTable) while still pulling in the embedded
+// books(title)/members(full_name) the table needs — confirmed live that
+// PostgREST allows mixing '*' with embedded resource selections in one
+// select string.
 export async function getAllLoans() {
   const { data, error } = await supabase
     .from('loans')
-    .select('id, member_id, due_date, loan_date, return_date, books(title), members(full_name)')
+    .select('*, books(title), members(full_name)')
     .order('loan_date', { ascending: false });
 
   if (error) throw error;
+  if (data?.[0]) recordLoanRow(data[0]);
   return data;
 }
 

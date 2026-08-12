@@ -1,5 +1,6 @@
-import { RefreshCw, RotateCcw } from 'lucide-react';
+import { DollarSign, RefreshCw, RotateCcw } from 'lucide-react';
 import { getLoanStatus } from '../../lib/loanStatus';
+import { computeFine } from '../../lib/fines';
 
 const COLUMNS = ['Book Title', 'Member Name', 'Borrowed Date', 'Due Date', 'Status', 'Actions'];
 
@@ -15,6 +16,20 @@ function formatDate(value) {
   return new Date(value).toLocaleDateString();
 }
 
+// What's actually payable right now for this loan:
+// - already paid -> nothing
+// - a finalized amount is on record (returned late, or a previous partial
+//   charge via markFineAsPaid) -> that exact amount
+// - still overdue and open, nothing finalized yet -> a live estimate as of
+//   today, same math the Fines report and Return Book modal both use, so a
+//   fine can be settled at the counter before the book itself comes back
+function getPayableFine(loan, status) {
+  if (loan.fine_paid) return 0;
+  if (Number(loan.fine_amount) > 0) return Number(loan.fine_amount);
+  if (status === 'overdue') return computeFine(loan.due_date).amount;
+  return 0;
+}
+
 function SkeletonRow() {
   return (
     <tr>
@@ -27,7 +42,16 @@ function SkeletonRow() {
   );
 }
 
-export default function LoansTable({ loans, loading, emptyMessage, renewingId, onReturn, onRenew }) {
+export default function LoansTable({
+  loans,
+  loading,
+  emptyMessage,
+  renewingId,
+  payingFineId,
+  onReturn,
+  onRenew,
+  onPayFine,
+}) {
   return (
     <div className="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200 dark:bg-slate-800 dark:ring-slate-700">
       <div className="overflow-x-auto">
@@ -85,30 +109,50 @@ export default function LoansTable({ loans, loading, emptyMessage, renewingId, o
                       </span>
                     </td>
                     <td className="px-6 py-4">
-                      {status === 'returned' ? (
-                        <span className="text-sm text-slate-400 dark:text-slate-500">—</span>
-                      ) : (
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => onReturn(loan)}
-                            className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-primary-600 hover:bg-primary-50 dark:text-primary-400 dark:hover:bg-slate-700"
-                          >
-                            <RotateCcw className="h-4 w-4" />
-                            Return
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onRenew(loan)}
-                            disabled={renewingId === loan.id}
-                            title="Renew — extends the due date by 7 days"
-                            className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-60 dark:text-slate-300 dark:hover:bg-slate-700"
-                          >
-                            <RefreshCw className={`h-4 w-4 ${renewingId === loan.id ? 'animate-spin' : ''}`} />
-                            Renew
-                          </button>
-                        </div>
-                      )}
+                      {(() => {
+                        const payableFine = getPayableFine(loan, status);
+                        return (
+                          <div className="flex items-center gap-1">
+                            {status !== 'returned' && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => onReturn(loan)}
+                                  className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-primary-600 hover:bg-primary-50 dark:text-primary-400 dark:hover:bg-slate-700"
+                                >
+                                  <RotateCcw className="h-4 w-4" />
+                                  Return
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => onRenew(loan)}
+                                  disabled={renewingId === loan.id}
+                                  title="Renew — extends the due date by 7 days"
+                                  className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-60 dark:text-slate-300 dark:hover:bg-slate-700"
+                                >
+                                  <RefreshCw className={`h-4 w-4 ${renewingId === loan.id ? 'animate-spin' : ''}`} />
+                                  Renew
+                                </button>
+                              </>
+                            )}
+                            {payableFine > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => onPayFine(loan, payableFine)}
+                                disabled={payingFineId === loan.id}
+                                title="Mark this fine as paid at the counter"
+                                className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-60 dark:text-red-400 dark:hover:bg-slate-700"
+                              >
+                                <DollarSign className="h-4 w-4" />
+                                {payingFineId === loan.id ? 'Saving…' : `Pay Fine ($${payableFine.toFixed(2)})`}
+                              </button>
+                            )}
+                            {status === 'returned' && payableFine === 0 && (
+                              <span className="text-sm text-slate-400 dark:text-slate-500">—</span>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </td>
                   </tr>
                 );
