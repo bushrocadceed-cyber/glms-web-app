@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { UserPlus, UserCog } from 'lucide-react';
 import StaffTable from '../components/staff/StaffTable';
 import InviteStaffModal from '../components/staff/InviteStaffModal';
@@ -19,6 +19,7 @@ import {
   updateStaffProfile,
 } from '../services/staffService';
 import { useToast } from '../context/ToastContext';
+import { getStoredCooldownUntil, setStoredCooldownUntil } from '../lib/staffSignupCooldown';
 
 export default function StaffManagementPage() {
   const [view, setView] = useState('active'); // 'active' | 'trash'
@@ -33,6 +34,39 @@ export default function StaffManagementPage() {
   const [submitting, setSubmitting] = useState(false);
   const [resettingPassword, setResettingPassword] = useState(false);
   const [resetPasswordPromptPerson, setResetPasswordPromptPerson] = useState(null);
+
+  // A rate-limited signUp() means Supabase itself is refusing more attempts
+  // for a while — retrying immediately just produces another 429, so this
+  // blocks the submit button for a cooldown window instead of letting an
+  // admin hammer it. Persisted to localStorage (initial state reads it back
+  // on mount) so a page reload right after a 429 doesn't reset the
+  // countdown to zero. Mirrors AdminRegistrationPage.jsx's identical
+  // pattern, kept as its own independent cooldown (see
+  // staffSignupCooldown.js) so hitting the limit here doesn't also block
+  // Register Admin, or vice versa.
+  const [cooldownUntil, setCooldownUntilState] = useState(() => getStoredCooldownUntil());
+  const [now, setNow] = useState(Date.now());
+
+  function setCooldownUntil(timestamp) {
+    setCooldownUntilState(timestamp);
+    setStoredCooldownUntil(timestamp);
+  }
+
+  useEffect(() => {
+    if (cooldownUntil <= Date.now()) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [cooldownUntil]);
+
+  const cooldownSeconds = Math.max(0, Math.ceil((cooldownUntil - now) / 1000));
+
+  // A synchronous, ref-based lock in addition to the `submitting` state —
+  // state updates only take effect on the next render, which leaves a
+  // brief window where a second click (or a rapid double-click before
+  // React re-renders the disabled button) could still slip a duplicate
+  // createStaffAccount() call through. This flips true immediately, in the
+  // same tick as the click handler, closing that gap.
+  const addStaffSubmitLockRef = useRef(false);
 
   async function handleInvite(values) {
     setSubmitting(true);
@@ -49,15 +83,30 @@ export default function StaffManagementPage() {
   }
 
   async function handleAddStaffMember(values) {
+    if (addStaffSubmitLockRef.current) return;
+    addStaffSubmitLockRef.current = true;
     setSubmitting(true);
     try {
       const result = await createStaffAccount(values);
-      showToast(
-        result.updatedExisting
-          ? `${values.email} already had a record — updated it instead.`
-          : `${values.fullName} added to staff. No login was created — use Invite via Email to grant access.`
-      );
-      if (values.email && !result.emailSaved) {
+
+      if (result.rateLimited) {
+        setCooldownUntil(Date.now() + 60_000);
+        showToast(
+          `${result.rateLimitMessage || 'Supabase is rate-limiting new logins right now.'} ${values.fullName} was saved as a staff directory entry with no login yet — use Invite via Email, or try Add Staff Member again once the limit clears.`,
+          'error'
+        );
+      } else if (result.updatedExisting) {
+        showToast(`${values.email} already had a record — updated it instead.`);
+      } else if (result.roleAssigned === false) {
+        showToast(
+          `Login created for ${values.email}, but the role could not be set automatically — open Edit on their row to set it to ${values.role === 'librarian' ? 'Librarian' : 'Staff'}.`,
+          'error'
+        );
+      } else {
+        showToast(`${values.fullName} added to staff — they can sign in now with the password set here.`);
+      }
+
+      if (values.email && !result.rateLimited && !result.emailSaved) {
         showToast(
           "Note: email is saved on this browser only for now — this database's profiles table has no email column yet, so it won't show up for other admins until the setup SQL is run.",
           'error'
@@ -69,6 +118,7 @@ export default function StaffManagementPage() {
       showToast(err.message || 'Failed to add staff member.', 'error');
     } finally {
       setSubmitting(false);
+      addStaffSubmitLockRef.current = false;
     }
   }
 
@@ -257,6 +307,7 @@ export default function StaffManagementPage() {
       {isAddStaffMemberModalOpen && (
         <AddStaffMemberModal
           submitting={submitting}
+          cooldownSeconds={cooldownSeconds}
           onClose={() => setIsAddStaffMemberModalOpen(false)}
           onSubmit={handleAddStaffMember}
         />

@@ -1,10 +1,12 @@
 import { useState } from 'react';
-import { Upload, UserRound } from 'lucide-react';
+import { Eye, EyeOff, Upload, UserRound } from 'lucide-react';
 import Modal from '../ui/Modal';
 
 const EMPTY_STAFF_FORM = {
   fullName: '',
   email: '',
+  password: '',
+  confirmPassword: '',
   role: 'staff',
   phone: '',
 };
@@ -29,9 +31,10 @@ function staffInputClasses(hasError) {
   }`;
 }
 
-export default function AddStaffMemberModal({ submitting, onClose, onSubmit }) {
+export default function AddStaffMemberModal({ submitting, cooldownSeconds = 0, onClose, onSubmit }) {
   const [form, setForm] = useState(EMPTY_STAFF_FORM);
   const [errors, setErrors] = useState({});
+  const [showPassword, setShowPassword] = useState(false);
   const [avatarDataUrl, setAvatarDataUrl] = useState(null);
 
   function handleChange(e) {
@@ -67,19 +70,30 @@ export default function AddStaffMemberModal({ submitting, onClose, onSubmit }) {
       nextErrors.email = 'Enter a valid email address.';
     }
 
+    if (!form.password) {
+      nextErrors.password = 'Password is required.';
+    } else if (form.password.length < 8) {
+      nextErrors.password = 'Password must be at least 8 characters.';
+    }
+
+    if (form.confirmPassword !== form.password) {
+      nextErrors.confirmPassword = 'Passwords do not match.';
+    }
+
     setErrors((prev) => ({ ...prev, ...nextErrors }));
     return Object.keys(nextErrors).length === 0;
   }
 
   function handleSubmit(e) {
     e.preventDefault();
-    if (submitting) return;
+    if (submitting || cooldownSeconds > 0) return;
     if (!validate()) return;
     if (errors.avatar) return;
 
     onSubmit({
       fullName: form.fullName,
       email: form.email,
+      password: form.password,
       role: form.role,
       phone: form.phone.trim() || null,
       avatarDataUrl,
@@ -89,9 +103,15 @@ export default function AddStaffMemberModal({ submitting, onClose, onSubmit }) {
   return (
     <Modal title="Add Staff Member" onClose={onClose}>
       <div className="mb-4 rounded-lg bg-primary-50 px-3 py-2.5 text-xs text-primary-700">
-        This adds a staff directory entry only — it does not create a login. To grant this person
-        dashboard access, use <span className="font-semibold">Invite via Email</span> separately.
+        This creates a real login — the new staff member can sign in right away with the email and
+        password set here.
       </div>
+
+      {cooldownSeconds > 0 && (
+        <div className="mb-4 rounded-lg bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
+          Supabase is rate-limiting new logins right now. You can try again in {cooldownSeconds}s.
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} noValidate className="space-y-4">
         <fieldset disabled={submitting} className="space-y-4">
@@ -116,6 +136,42 @@ export default function AddStaffMemberModal({ submitting, onClose, onSubmit }) {
               className={staffInputClasses(errors.email)}
             />
             {errors.email && <p className="mt-1 text-xs text-red-600">{errors.email}</p>}
+          </div>
+
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">Password</label>
+            <div className="relative">
+              <input
+                type={showPassword ? 'text' : 'password'}
+                name="password"
+                value={form.password}
+                onChange={handleChange}
+                className={`${staffInputClasses(errors.password)} pr-10`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((prev) => !prev)}
+                tabIndex={-1}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+            {errors.password && <p className="mt-1 text-xs text-red-600">{errors.password}</p>}
+          </div>
+
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">Confirm Password</label>
+            <input
+              type={showPassword ? 'text' : 'password'}
+              name="confirmPassword"
+              value={form.confirmPassword}
+              onChange={handleChange}
+              className={staffInputClasses(errors.confirmPassword)}
+            />
+            {errors.confirmPassword && (
+              <p className="mt-1 text-xs text-red-600">{errors.confirmPassword}</p>
+            )}
           </div>
 
           <div>
@@ -178,9 +234,14 @@ export default function AddStaffMemberModal({ submitting, onClose, onSubmit }) {
             </button>
             <button
               type="submit"
+              disabled={submitting || cooldownSeconds > 0}
               className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-semibold text-white hover:bg-primary-700 disabled:opacity-60"
             >
-              {submitting ? 'Saving…' : 'Add Staff Member'}
+              {submitting
+                ? 'Saving…'
+                : cooldownSeconds > 0
+                  ? `Try again in ${cooldownSeconds}s`
+                  : 'Add Staff Member'}
             </button>
           </div>
         </fieldset>

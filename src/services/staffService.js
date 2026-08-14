@@ -191,22 +191,13 @@ async function upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUr
   return { id, updatedExisting: false, emailSaved };
 }
 
-// Creates a profiles-only staff directory entry. Per explicit instruction,
-// this never calls supabase.auth.signUp() — so it never triggers Supabase's
-// email rate limit, but it also never creates a real login. There is no
-// auth.users row backing this id; nobody can sign in as this person until
-// a separate step (e.g. "Invite via Email", once its Edge Function is
-// deployed) actually grants them a real account.
-export async function createStaffAccount({ fullName, email, role, phone, avatarDataUrl }) {
-  const { emailColumnExists, existing } = await findProfileByEmail(email);
-  const result = await upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUrl, existing, emailColumnExists });
-  return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
-}
-
-// Creates a REAL Supabase Auth login (unlike createStaffAccount above,
-// which is profiles-only). Only reachable from the admin-gated Manage Staff
-// page — signUp() itself has no concept of caller permissions, so that
-// route-level gate is what actually keeps this from being public self-service.
+// Shared by createStaffAccount and registerAdmin below — both need to
+// create a REAL Supabase Auth login for a brand-new email, then assign the
+// role the admin actually picked, with the same rate-limit safety net
+// either way. Only reachable from the admin-gated Manage Staff / Admin
+// Registration pages — signUp() itself has no concept of caller
+// permissions, so that route-level gate is what actually keeps this from
+// being public self-service.
 //
 // Uses a separate client (see tempAuthClient.js) for the signUp() call —
 // NOT the app's shared client. auth.signUp() always signs in as the
@@ -221,34 +212,19 @@ export async function createStaffAccount({ fullName, email, role, phone, avatarD
 // once per tab rather than once per registration attempt.
 //
 // The new account always starts as 'staff' via the on_auth_user_created
-// trigger — nothing in the signUp() call itself can make it 'admin'
+// trigger — nothing in the signUp() call itself can set any other role
 // directly, because the trigger deliberately never trusts a
 // client-supplied role (that's what stops someone from self-escalating by
 // calling signUp() directly with crafted metadata, bypassing this UI
-// entirely). Immediately after, this promotes the new row to admin as a
+// entirely). Immediately after, this sets the actually-requested role as a
 // separate step — on the shared `supabase` client, i.e. running as the
 // ACTING ADMIN'S OWN already-authenticated session, not as anything
 // supplied by the signup request. That's gated by the profiles_update_admin
-// RLS policy exactly like promoting any existing profile: only someone who
-// is already an admin can do it. Someone bypassing this UI and calling
-// auth.signUp() directly still only ever gets 'staff', because they have
-// no admin session available to perform this follow-up update with.
-export async function registerAdmin({ fullName, email, password, phone, avatarDataUrl }) {
-  const { emailColumnExists, existing } = await findProfileByEmail(email);
-
-  if (existing) {
-    const result = await upsertDirectoryEntry({
-      fullName,
-      email,
-      role: 'admin',
-      phone,
-      avatarDataUrl,
-      existing,
-      emailColumnExists,
-    });
-    return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
-  }
-
+// RLS policy: only someone who is already an admin can update someone
+// else's role, to 'admin' or any other value. Someone bypassing this UI and
+// calling auth.signUp() directly still only ever gets 'staff', because they
+// have no admin session available to perform this follow-up update with.
+async function signUpWithFallback({ fullName, email, password, role, phone, avatarDataUrl, emailColumnExists }) {
   const tempClient = getTempAuthClient();
 
   const { data: signUpData, error: signUpError } = await tempClient.auth.signUp({
@@ -266,16 +242,16 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
 
     if (isRateLimited) {
       // Supabase won't let a real login be created right now — rather than
-      // lose everything typed into the form, fall back to the same
-      // directory-only entry createStaffAccount uses (role: 'admin', no
-      // login). loginCreated: false tells the caller to be upfront that
-      // this person can't sign in yet — Invite via Email, or retrying
-      // Register Admin once the rate limit clears, is what actually grants
-      // access; this never pretends a login exists when it doesn't.
+      // lose everything typed into the form, fall back to a directory-only
+      // entry (see upsertDirectoryEntry). loginCreated: false tells the
+      // caller to be upfront that this person can't sign in yet — Invite
+      // via Email (once its Edge Function is deployed), or retrying this
+      // once the rate limit clears, is what actually grants access; this
+      // never pretends a login exists when it doesn't.
       const fallbackResult = await upsertDirectoryEntry({
         fullName,
         email,
-        role: 'admin',
+        role,
         phone,
         avatarDataUrl,
         existing: null,
@@ -302,7 +278,7 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
   const user = signUpData.user;
   if (!user) throw new Error('Registration did not return a user.');
 
-  // Same anti-enumeration behavior as createStaffAccount: a look-alike
+  // Same anti-enumeration behavior as upsertDirectoryEntry: a look-alike
   // "success" with no error when the email already has an auth account but
   // no matching profile (an orphan from an earlier attempt).
   if (!user.identities || user.identities.length === 0) {
@@ -311,12 +287,12 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
     );
   }
 
-  const promotePayload = emailColumnExists ? { role: 'admin', phone: phone || null } : { role: 'admin' };
-  const { error: promoteError } = await supabase.from('profiles').update(promotePayload).eq('id', user.id);
+  const rolePayload = emailColumnExists ? { role, phone: phone || null } : { role };
+  const { error: roleError } = await supabase.from('profiles').update(rolePayload).eq('id', user.id);
 
-  // Same gap this whole function is otherwise careful about: the promote
-  // step above never touches profiles.email (it wasn't in promotePayload
-  // to begin with), so without this call a freshly-registered admin would
+  // Same gap this whole function is otherwise careful about: the role-set
+  // step above never touches profiles.email (it wasn't in rolePayload to
+  // begin with), so without this call a freshly-registered account would
   // have a real login but still show no email anywhere in the Manage Staff
   // table — persistStaffEmail is what writes it to profiles.email (if that
   // column exists) and to the local fallback either way.
@@ -328,15 +304,54 @@ export async function registerAdmin({ fullName, email, password, phone, avatarDa
   }
 
   // The login itself is already fully created and working at this point —
-  // a failure here only means the promotion step didn't take, not that
-  // registration failed. Surfaced distinctly so the caller can tell the
-  // admin to promote manually via Edit instead of masking it as a full
-  // success or a full failure.
-  if (promoteError) {
-    return { success: true, loginCreated: true, promotedToAdmin: false, emailSaved };
+  // a failure here only means the role-set step didn't take (it stays
+  // 'staff', the trigger's default), not that registration failed.
+  // Surfaced distinctly so the caller can tell the admin to set the role
+  // manually via Edit instead of masking it as a full success or failure.
+  return { success: true, loginCreated: true, roleAssigned: !roleError, emailSaved };
+}
+
+// Creates a real Supabase Auth login for a new staff/librarian account (via
+// signUpWithFallback above), or updates an existing directory-only entry in
+// place if this email already has one. Falls back to a login-less
+// directory entry only if Supabase's signup rate limit is hit right now —
+// see signUpWithFallback's own comment for why, and for how a caller tells
+// the two outcomes apart (result.loginCreated).
+export async function createStaffAccount({ fullName, email, password, role, phone, avatarDataUrl }) {
+  const { emailColumnExists, existing } = await findProfileByEmail(email);
+
+  if (existing) {
+    const result = await upsertDirectoryEntry({ fullName, email, role, phone, avatarDataUrl, existing, emailColumnExists });
+    return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
   }
 
-  return { success: true, loginCreated: true, promotedToAdmin: true, emailSaved };
+  return signUpWithFallback({ fullName, email, password, role, phone, avatarDataUrl, emailColumnExists });
+}
+
+// Same shape as createStaffAccount above, hardcoded to role: 'admin'.
+export async function registerAdmin({ fullName, email, password, phone, avatarDataUrl }) {
+  const { emailColumnExists, existing } = await findProfileByEmail(email);
+
+  if (existing) {
+    const result = await upsertDirectoryEntry({
+      fullName,
+      email,
+      role: 'admin',
+      phone,
+      avatarDataUrl,
+      existing,
+      emailColumnExists,
+    });
+    return { success: true, updatedExisting: result.updatedExisting, emailSaved: result.emailSaved };
+  }
+
+  const result = await signUpWithFallback({ fullName, email, password, role: 'admin', phone, avatarDataUrl, emailColumnExists });
+  if (!result.loginCreated) return result;
+
+  // promotedToAdmin is what AdminRegistrationPage.jsx's toast logic reads —
+  // kept as its own name here (rather than the generic roleAssigned) since
+  // "admin" is implied by which function this is.
+  return { success: true, loginCreated: true, promotedToAdmin: result.roleAssigned, emailSaved: result.emailSaved };
 }
 
 // Shared by updateStaffProfile and saveStaffEmail below. Tries the real

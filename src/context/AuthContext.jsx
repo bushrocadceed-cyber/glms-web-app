@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import { getAvatar, hydrateAvatarFromRow, persistAvatarRemote, setAvatar } from '../lib/avatarStore';
 import { isAvatarColumnKnownPresent, recordProfileRow as recordAvatarProfileRow } from '../lib/profileAvatarColumn';
+import { isAdminRole } from '../lib/roles';
 
 const AuthContext = createContext(null);
 
@@ -134,9 +135,43 @@ export function AuthProvider({ children }) {
     };
   }, []);
 
-  async function signIn(email, password) {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+  // expectedRole is the Login page's "Select Role" dropdown value
+  // ('admin' or 'staff') — optional so nothing else calling signIn (there
+  // isn't currently, but nothing should have to) is forced to pass one.
+  // Password auth alone only proves *who* someone is, not that they picked
+  // the right option in that dropdown — this is what actually enforces the
+  // match, by re-signing-out immediately if the account's real
+  // profiles.role disagrees with what was selected, rather than letting a
+  // Staff account into a session someone thinks they started as Admin (or
+  // the reverse).
+  async function signIn(email, password, expectedRole) {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
+
+    if (!expectedRole) return;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', data.user.id)
+      .maybeSingle();
+
+    if (profileError || !profile) {
+      await supabase.auth.signOut();
+      throw new Error("Could not verify this account's role. Contact an admin.");
+    }
+
+    const isAdmin = isAdminRole(profile.role);
+    const wantsAdmin = expectedRole === 'admin';
+
+    if (isAdmin !== wantsAdmin) {
+      await supabase.auth.signOut();
+      throw new Error(
+        `This account is registered as ${isAdmin ? 'an Admin' : 'Staff'}, not ${
+          wantsAdmin ? 'an Admin' : 'Staff'
+        }. Select the correct role and sign in again.`
+      );
+    }
   }
 
   async function signOut() {

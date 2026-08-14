@@ -12,9 +12,15 @@ export default function LoginPage() {
   const { showToast } = useToast();
   const navigate = useNavigate();
 
-  // Select Role is a front-door UI choice matching the reference design —
-  // the account's real role/permissions still come from its profiles.role
-  // row after sign-in, this doesn't grant or restrict anything by itself.
+  // Select Role is now actually enforced (see AuthContext's signIn) — the
+  // account still authenticates by email/password like any login, but
+  // signIn re-signs the session out if profiles.role doesn't match what
+  // was picked here, rather than silently accepting any role selection.
+  // No "Member" option: members are patron records with no auth.users
+  // account at all (see MemberFormModal.jsx), so there is no login that
+  // could ever satisfy that selection — offering it here would just be
+  // another way to get a confusing "invalid" error for something that was
+  // never going to work.
   const [role, setRole] = useState('staff');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -27,7 +33,7 @@ export default function LoginPage() {
     setError('');
     setSubmitting(true);
     try {
-      await signIn(email, password);
+      await signIn(email, password, role);
       navigate('/', { replace: true });
     } catch (err) {
       setError(err.message || 'Invalid email or password.');
@@ -70,7 +76,6 @@ export default function LoginPage() {
               >
                 <option value="admin">Admin</option>
                 <option value="staff">Staff</option>
-                <option value="member">Member</option>
               </select>
             </div>
 
