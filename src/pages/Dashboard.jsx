@@ -33,6 +33,15 @@ export default function Dashboard() {
     };
   }, []);
 
+  // Xisaabinta saxda ah ee Copies by Status
+  const availableCount = stats?.availableBooks ?? 0;
+  const checkedOutCount = Math.max(0, (stats?.totalBooks ?? 0) - availableCount);
+
+  const realInventoryData = [
+    { name: 'Available', value: availableCount },
+    { name: 'Checked Out', value: checkedOutCount },
+  ];
+
   return (
     <div className="space-y-6">
       {/* Row 1: quick actions, full width */}
@@ -72,18 +81,13 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Row 3: the two charts, side by side, sized to their own content */}
+      {/* Row 3: the two charts, side by side */}
       <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-        <InventoryChart data={chartData.inventory} loading={chartLoading} />
+        <InventoryChart data={realInventoryData} loading={loading || chartLoading} />
         <LoansChart data={chartData.loans} loading={chartLoading} />
       </div>
 
-      {/* Row 4: due-dates calendar | book categories | recent activity.
-          No min-heights anywhere — each card sizes to its own content, and
-          CSS Grid's default `items-stretch` equalizes the three to whichever
-          one is naturally tallest (each card's own h-full + flex-col lets
-          its content area fill that shared height instead of leaving a gap
-          at the bottom). */}
+      {/* Row 4: calendar, categories, activity */}
       <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
         <DueDatesCalendar />
         <CategoriesSummary />
