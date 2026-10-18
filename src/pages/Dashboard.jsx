@@ -33,12 +33,15 @@ export default function Dashboard() {
     };
   }, []);
 
-  // Xisaabinta saxda ah ee Copies by Status
-  const availableCount = stats?.availableBooks ?? 0;
-  const checkedOutCount = Math.max(0, (stats?.totalBooks ?? 0) - availableCount);
+  // 1. Tirada guud iyo kuwa yaalla oo ka socda hook-ka stats
+  const totalBooks = stats?.totalBooks ?? 0;
+  const availableBooks = stats?.availableBooks ?? 0;
+
+  // 2. Checked Out = Total Books - Available Books (Si toos ah oo aan khaldamaynin)
+  const checkedOutCount = Math.max(0, totalBooks - availableBooks);
 
   const realInventoryData = [
-    { name: 'Available', value: availableCount },
+    { name: 'Available', value: availableBooks },
     { name: 'Checked Out', value: checkedOutCount },
   ];
 
@@ -47,7 +50,7 @@ export default function Dashboard() {
       {/* Row 1: quick actions, full width */}
       <QuickActions />
 
-      {/* Row 2: the four stat cards, evenly spaced across the full width */}
+      {/* Row 2: the four stat cards */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <StatCard
           icon={BookOpen}
@@ -81,7 +84,7 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Row 3: the two charts, side by side */}
+      {/* Row 3: charts */}
       <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
         <InventoryChart data={realInventoryData} loading={loading || chartLoading} />
         <LoansChart data={chartData.loans} loading={chartLoading} />
